@@ -1669,7 +1669,7 @@ static int coroutine_fn bdrv_co_do_writev(BlockDriverState *bs,
     }
 
     tracked_request_begin(&req, bs, sector_num, nb_sectors, true);
-
+    
     ret = drv->bdrv_co_writev(bs, sector_num, nb_sectors, qiov);
 
     if (bs->dirty_bitmap) {
@@ -3336,7 +3336,7 @@ static int coroutine_fn bdrv_co_io_em(BlockDriverState *bs, int64_t sector_num,
         .coroutine = qemu_coroutine_self(),
     };
     BlockDriverAIOCB *acb;
-
+    
     if (is_write) {
         acb = bs->drv->bdrv_aio_writev(bs, sector_num, iov, nb_sectors,
                                        bdrv_co_io_em_complete, &co);

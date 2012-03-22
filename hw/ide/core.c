@@ -592,15 +592,15 @@ void ide_dma_cb(void *opaque, int ret)
     printf("ide_dma_cb: sector_num=%" PRId64 " n=%d, cmd_cmd=%d\n",
            sector_num, n, s->dma_cmd);
 #endif
-
+    /* kazushi addition */
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_bdrv_read(s->bs, &s->sg, sector_num,
-                                           ide_dma_cb, s);
+                                           ide_dma_cb, s); /* dma-helpers.cに飛んでる */
         break;
     case IDE_DMA_WRITE:
         s->bus->dma->aiocb = dma_bdrv_write(s->bs, &s->sg, sector_num,
-                                            ide_dma_cb, s);
+                                            ide_dma_cb, s); /* dma-helpers.cに飛んでる */
         break;
     case IDE_DMA_TRIM:
         s->bus->dma->aiocb = dma_bdrv_io(s->bs, &s->sg, sector_num,

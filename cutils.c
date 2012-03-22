@@ -166,7 +166,7 @@ void qemu_iovec_add(QEMUIOVector *qiov, void *base, size_t len)
     }
     qiov->iov[qiov->niov].iov_base = base;
     qiov->iov[qiov->niov].iov_len = len;
-    qiov->size += len;
+    qiov->size += len; /* kazushi:ここでsector数を足しているように見える */
     ++qiov->niov;
 }
 

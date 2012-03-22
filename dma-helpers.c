@@ -102,7 +102,7 @@ static void dma_complete(DMAAIOCB *dbs, int ret)
         qemu_aio_release(dbs);
     }
 }
-
+/* dma_bdrv_read -> dma_bdrv_io -> ここ */ 
 static void dma_bdrv_cb(void *opaque, int ret)
 {
     DMAAIOCB *dbs = (DMAAIOCB *)opaque;
@@ -120,12 +120,19 @@ static void dma_bdrv_cb(void *opaque, int ret)
         return;
     }
 
+    printf("***********************************************************\n");
+
     while (dbs->sg_cur_index < dbs->sg->nsg) {
         cur_addr = dbs->sg->sg[dbs->sg_cur_index].base + dbs->sg_cur_byte;
         cur_len = dbs->sg->sg[dbs->sg_cur_index].len - dbs->sg_cur_byte;
+        /* ここで物理メモリをホストの仮想アドレス(ポインタ)に変換している */
         mem = cpu_physical_memory_map(cur_addr, &cur_len, !dbs->to_dev);
         if (!mem)
             break;
+        printf("sector: %lld phys (0x%08lx) -> virt (%p) [%lx]\n", 
+               dbs->sector_num,
+               (unsigned long)cur_addr, 
+               mem, (unsigned long)cur_len);
         qemu_iovec_add(&dbs->iov, mem, cur_len);
         dbs->sg_cur_byte += cur_len;
         if (dbs->sg_cur_byte == dbs->sg->sg[dbs->sg_cur_index].len) {
@@ -134,12 +141,15 @@ static void dma_bdrv_cb(void *opaque, int ret)
         }
     }
 
+    printf("***********************************************************\n");
+
     if (dbs->iov.size == 0) {
         trace_dma_map_wait(dbs);
         cpu_register_map_client(dbs, continue_after_map_failure);
         return;
     }
-
+    /* kazushi: block.c:bdrv_aio_readv/writevにつながってる */
+    /* io_funcはdma_bdrv_ioの中で登録されている */
     dbs->acb = dbs->io_func(dbs->bs, dbs->sector_num, &dbs->iov,
                             dbs->iov.size / 512, dma_bdrv_cb, dbs);
     assert(dbs->acb);
@@ -166,7 +176,7 @@ static AIOPool dma_aio_pool = {
     .aiocb_size         = sizeof(DMAAIOCB),
     .cancel             = dma_aio_cancel,
 };
-
+/* kazushi dma_bdrv_read/write -> dma_bdrv_io */
 BlockDriverAIOCB *dma_bdrv_io(
     BlockDriverState *bs, QEMUSGList *sg, uint64_t sector_num,
     DMAIOFunc *io_func, BlockDriverCompletionFunc *cb,

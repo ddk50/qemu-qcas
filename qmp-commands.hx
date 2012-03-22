@@ -1146,7 +1146,7 @@ Each json-object contain the following:
              - Possible values: "blkdebug", "bochs", "cloop", "cow", "dmg",
                                 "file", "file", "ftp", "ftps", "host_cdrom",
                                 "host_device", "host_floppy", "http", "https",
-                                "nbd", "parallels", "qcow", "qcow2", "raw",
+                                "nbd", "parallels", "qcow", "qcow2", "qcas", "raw",
                                 "tftp", "vdi", "vmdk", "vpc", "vvfat"
          - "backing_file": backing file name (json-string, optional)
          - "encrypted": true if encrypted, false otherwise (json-bool)

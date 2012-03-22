@@ -60,10 +60,12 @@ static int qcow2_probe(const uint8_t *buf, int buf_size, const char *filename)
 
     if (buf_size >= sizeof(QCowHeader) &&
         be32_to_cpu(cow_header->magic) == QCOW_MAGIC &&
-        be32_to_cpu(cow_header->version) >= QCOW_VERSION)
+        be32_to_cpu(cow_header->version) >= QCOW_VERSION) {        
+        printf("%s\n", __FUNCTION__);
         return 100;
-    else
+    } else {
         return 0;
+    }
 }
 
 
@@ -146,6 +148,8 @@ static int qcow2_open(BlockDriverState *bs, int flags)
     QCowHeader header;
     uint64_t ext_end;
     bool writethrough;
+
+    printf("fuck you: %s: %s\n", __FUNCTION__, bs->device_name);
 
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
@@ -392,6 +396,8 @@ static coroutine_fn int qcow2_co_readv(BlockDriverState *bs, int64_t sector_num,
     uint64_t bytes_done = 0;
     QEMUIOVector hd_qiov;
     uint8_t *cluster_data = NULL;
+
+    printf("!!!!!!!!!!!!!%s!!!!!!!!!!!!!!\n", __FUNCTION__);
 
     qemu_iovec_init(&hd_qiov, qiov->niov);
 
