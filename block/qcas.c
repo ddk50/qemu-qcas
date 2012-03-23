@@ -195,7 +195,7 @@ static void hash2fname(const QCasFingerprintBlock *hash_value,
 static void form_fname(char *fname, const QCasFingerprintBlock *hash_value)
 {
     hash2fname(hash_value, fname);
-    strcat(fname, ".img");
+    strcat(fname, ".raw");
 }
 
 static void rehashing_file(BlockDriverState *bs, 
@@ -234,8 +234,9 @@ static void rehashing_file(BlockDriverState *bs,
         if (ret < 0) {
             
             printf("new sha1 block file will be created\n");
-            print_hash(&new_hash_value);
+            print_hash(&new_hash_value);            
             
+            printf("!!!!!!!!!!!!!!!!!%s!!!!!!!!!!!!!!!!\n", new_file_name);
             ret = bdrv_create_file(new_file_name, NULL);
             printf("%s file create ret: %d\n", new_file_name, ret);
             assert(ret >= 0);
@@ -314,14 +315,14 @@ static void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
     
     if (memcmp(null_hash_value.sha1_hash,
                hash_value->sha1_hash,
-               20)) {
+               20) == 0) {
         printf("unlinking...null file\n");
         unlink(filename);
     }
     
     ret = bdrv_file_open(&hf_bs, filename, BDRV_O_RDWR);
     if (ret < 0) {
-
+        /* create null file */
         ret = memcmp(null_hash_value.sha1_hash,
                      hash_value->sha1_hash,
                      20);
@@ -427,6 +428,8 @@ static coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
 
     qemu_iovec_to_buffer(qiov, cluster_data);
 
+    qemu_co_mutex_lock(&s->lock);
+
     while (current_byte < end_byte) {
         hash_index = current_byte / QCAS_BLOCK_SIZE;
         file_offset = current_byte % QCAS_BLOCK_SIZE;
@@ -450,6 +453,8 @@ static coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
         buffer_pos += write_size;                        
         remaining_byte -= write_size;
     }
+
+    qemu_co_mutex_unlock(&s->lock);
 
     qemu_vfree(cluster_data);
 
