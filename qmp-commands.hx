@@ -1147,7 +1147,7 @@ Each json-object contain the following:
                                 "file", "file", "ftp", "ftps", "host_cdrom",
                                 "host_device", "host_floppy", "http", "https",
                                 "nbd", "parallels", "qcow", "qcow2", "qcas", "raw",
-                                "tftp", "vdi", "vmdk", "vpc", "vvfat"
+                                "raw2", "tftp", "vdi", "vmdk", "vpc", "vvfat"
          - "backing_file": backing file name (json-string, optional)
          - "encrypted": true if encrypted, false otherwise (json-bool)
          - "bps": limit total bytes per second (json-int)

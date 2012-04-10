@@ -12,19 +12,17 @@ static int raw_open(BlockDriverState *bs, int flags)
 static int coroutine_fn raw_co_readv(BlockDriverState *bs, int64_t sector_num,
                                      int nb_sectors, QEMUIOVector *qiov)
 {
-    printf("%s\n", __FUNCTION__);
     return bdrv_co_readv(bs->file, sector_num, nb_sectors, qiov);
 }
 
 static int coroutine_fn raw_co_writev(BlockDriverState *bs, int64_t sector_num,
                                       int nb_sectors, QEMUIOVector *qiov)
 {
-    printf("%s\n", __FUNCTION__);
     return bdrv_co_writev(bs->file, sector_num, nb_sectors, qiov);
 }
 
 static void raw_close(BlockDriverState *bs)
-{
+{    
 }
 
 static int coroutine_fn raw_co_flush(BlockDriverState *bs)
@@ -44,7 +42,6 @@ static int raw_truncate(BlockDriverState *bs, int64_t offset)
 
 static int raw_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
-    printf("%s returning 1\n", __FUNCTION__);
     return 1; /* everything can be opened as raw image */
 }
 

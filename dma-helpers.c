@@ -120,8 +120,6 @@ static void dma_bdrv_cb(void *opaque, int ret)
         return;
     }
 
-    printf("***********************************************************\n");
-
     while (dbs->sg_cur_index < dbs->sg->nsg) {
         cur_addr = dbs->sg->sg[dbs->sg_cur_index].base + dbs->sg_cur_byte;
         cur_len = dbs->sg->sg[dbs->sg_cur_index].len - dbs->sg_cur_byte;
@@ -129,10 +127,6 @@ static void dma_bdrv_cb(void *opaque, int ret)
         mem = cpu_physical_memory_map(cur_addr, &cur_len, !dbs->to_dev);
         if (!mem)
             break;
-        printf("sector: %lld phys (0x%08lx) -> virt (%p) [%lx]\n", 
-               dbs->sector_num,
-               (unsigned long)cur_addr, 
-               mem, (unsigned long)cur_len);
         qemu_iovec_add(&dbs->iov, mem, cur_len);
         dbs->sg_cur_byte += cur_len;
         if (dbs->sg_cur_byte == dbs->sg->sg[dbs->sg_cur_index].len) {
@@ -140,8 +134,6 @@ static void dma_bdrv_cb(void *opaque, int ret)
             ++dbs->sg_cur_index;
         }
     }
-
-    printf("***********************************************************\n");
 
     if (dbs->iov.size == 0) {
         trace_dma_map_wait(dbs);
