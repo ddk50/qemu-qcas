@@ -397,8 +397,6 @@ static coroutine_fn int qcow2_co_readv(BlockDriverState *bs, int64_t sector_num,
     QEMUIOVector hd_qiov;
     uint8_t *cluster_data = NULL;
 
-    printf("!!!!!!!!!!!!!%s!!!!!!!!!!!!!!\n", __FUNCTION__);
-
     qemu_iovec_init(&hd_qiov, qiov->niov);
 
     qemu_co_mutex_lock(&s->lock);

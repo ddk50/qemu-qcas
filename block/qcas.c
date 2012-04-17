@@ -118,6 +118,21 @@ static int is_buffer_zerofilled(const void *buf, int size)
     return 1;
 }
 
+struct align_data {
+    uint32_t a[5];
+};
+
+static void qcas_pseudo_hash(QCasFingerprintBlock *hash)
+{
+    struct align_data *data = (struct align_data*)hash;
+    
+    data->a[0] = rand();
+    data->a[1] = rand();
+    data->a[2] = rand();
+    data->a[3] = rand();
+    data->a[4] = rand();
+}    
+
 static int qcas_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
     const QCasHeader *cas_header = (const void *)buf;
@@ -243,14 +258,14 @@ static void rehashing_file(BlockDriverState *bs,
                            const QCasFingerprintBlock *old_hash_value)
 {
     BDRVQcasState *s = recipe_bs->opaque;
-    SHA1_CTX ctx;
+//    SHA1_CTX ctx;
     QCasFingerprintBlock new_hash_value;
     int ret;
     unsigned char *buffer;
     BlockDriverState *new_bs;
     char new_file_name[51];
     
-    SHA1Init(&ctx);
+//    SHA1Init(&ctx);
 
     buffer = qemu_blockalign(bs, QCAS_BLOCK_SIZE);
     assert(buffer != NULL);
@@ -258,8 +273,9 @@ static void rehashing_file(BlockDriverState *bs,
 
     ret = bdrv_pread(bs, 0, buffer, QCAS_BLOCK_SIZE);   
     assert(ret == QCAS_BLOCK_SIZE);
-    SHA1Update(&ctx, buffer, QCAS_BLOCK_SIZE);
-    SHA1Final(new_hash_value.sha1_hash, &ctx);
+//    SHA1Update(&ctx, buffer, QCAS_BLOCK_SIZE);
+//    SHA1Final(new_hash_value.sha1_hash, &ctx);
+    qcas_pseudo_hash(&new_hash_value);
 
     if (memcmp(old_hash_value->sha1_hash, 
                new_hash_value.sha1_hash,
@@ -381,10 +397,10 @@ static void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
             assert(ret == 0);
         }
     } else {
-        /* すでにハッシュブロックがあるのでrehashingしないといけない */
+        /* すでにハッシュブロックがあるのでrehashingしないといけない */        
     }
 
-    assert(hf_bs != NULL);   
+    assert(hf_bs != NULL);
 
     ret = bdrv_pwrite(hf_bs, file_offset, out_buffer, write_size);
     assert(ret == write_size);
@@ -617,6 +633,7 @@ static int qcas_has_zero_init(BlockDriverState *bs)
 {
     //    return bdrv_has_zero_init(bs->file);
     // this funtion must be returning zero!!!!
+    srand((unsigned) time(NULL));
     return 0;
 }
 
@@ -653,4 +670,3 @@ static void bdrv_qcas_init(void)
 }
 
 block_init(bdrv_qcas_init);
-
