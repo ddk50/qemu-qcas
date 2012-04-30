@@ -26,6 +26,7 @@
 #include "module.h"
 #include "migration.h"
 #include "qcas-sha1.h"
+#include <crc32.h>
 
 #define QCAS_MAGIC (('Q' << 24) | ('C' << 16) | ('A' << 8) | 'S')
 #define QCAS_VERSION 1
@@ -75,9 +76,46 @@ typedef struct BDRVQcasState {
     CoMutex lock;
 } BDRVQcasState;
 
-static void form_fname(char *fname, const QCasFingerprintBlock *hash_value);
+void print_hash(QCasFingerprintBlock *hash);
+int is_buffer_zerofilled(const void *buf, int size);
+ void qcas_pseudo_hash(QCasFingerprintBlock *hash, 
+                       const uint8_t *buffer, int len);
+int qcas_probe(const uint8_t *buf, int buf_size, const char *filename);
+int qcas_open(BlockDriverState *bs, int flags);
+void qcas_close(BlockDriverState *bs);
+int qcas_create(const char *filename, QEMUOptionParameter *options);
+ void hash2fname(const QCasFingerprintBlock *hash_value,
+                 char *filename);
+void form_fname(char *fname, const QCasFingerprintBlock *hash_value);
+ void rehashing_file(BlockDriverState *bs, 
+                     BlockDriverState *recipe_bs,
+                     uint64_t hash_index,
+                     const QCasFingerprintBlock *old_hash_value);
+ void qcas_co_read_hashfile(const QCasFingerprintBlock *hash_value,
+                            uint64_t file_offset,
+                            uint64_t read_size,
+                            uint8_t *in_buffer);
+ void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
+                             uint64_t hash_index,
+                             const QCasFingerprintBlock *hash_value,
+                             uint64_t file_offset,
+                             uint64_t write_size,
+                             const uint8_t *out_buffer);
+ coroutine_fn int qcas_co_readv(BlockDriverState *bs, int64_t sector_num,
+                                int nb_sectors, QEMUIOVector *qiov);
+ coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
+                                 int nb_sectors, QEMUIOVector *qiov);
+coroutine_fn int qcas_co_flush(BlockDriverState *bs);
+coroutine_fn int qcas_co_is_allocated(BlockDriverState *bs,
+                                      int64_t sector_num, int nb_sectors, int *pnum);
+int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi);
+coroutine_fn int qcas_co_discard(BlockDriverState *bs,
+                                 int64_t sector_num, int nb_sectors);
+int qcas_truncate(BlockDriverState *bs, int64_t offset);
+int qcas_has_zero_init(BlockDriverState *bs);
+void bdrv_qcas_init(void);
 
-static void print_hash(QCasFingerprintBlock *hash)
+ void print_hash(QCasFingerprintBlock *hash)
 {
 #ifdef DEBUG
     int i;
@@ -88,7 +126,7 @@ static void print_hash(QCasFingerprintBlock *hash)
 #endif
 }
 
-/* static void generate_hash_from_buffer(const char *prefix, uint8_t *data, int size) */
+/*  void generate_hash_from_buffer(const char *prefix, uint8_t *data, int size) */
 /* { */
 /*     SHA1_CTX ctx; */
 /*     uint8_t sha1_hash[20]; */
@@ -104,11 +142,11 @@ static void print_hash(QCasFingerprintBlock *hash)
 /*     printf("\n"); */
 /* } */
 
-static QCasFingerprintBlock null_hash_value = {
+ QCasFingerprintBlock null_hash_value = {
     .sha1_hash = {0},
 };
 
-static int is_buffer_zerofilled(const void *buf, int size)
+ int is_buffer_zerofilled(const void *buf, int size)
 {
     int i;
     for (i = 0 ; i < size ; i++) {
@@ -122,18 +160,20 @@ struct align_data {
     uint32_t a[5];
 };
 
-static void qcas_pseudo_hash(QCasFingerprintBlock *hash)
+ void qcas_pseudo_hash(QCasFingerprintBlock *hash, 
+                             const uint8_t *buffer, int len)
 {
     struct align_data *data = (struct align_data*)hash;
+    uint32_t *blocks = (uint32_t*)buffer;
     
-    data->a[0] = rand();
-    data->a[1] = rand();
-    data->a[2] = rand();
-    data->a[3] = rand();
-    data->a[4] = rand();
+    data->a[0] = blocks[0];
+    data->a[1] = blocks[200];
+    data->a[2] = blocks[400];
+    data->a[3] = blocks[600];
+    data->a[4] = blocks[800];
 }    
 
-static int qcas_probe(const uint8_t *buf, int buf_size, const char *filename)
+ int qcas_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
     const QCasHeader *cas_header = (const void *)buf;
     if (be32_to_cpu(cas_header->magic) == QCAS_MAGIC &&
@@ -144,7 +184,7 @@ static int qcas_probe(const uint8_t *buf, int buf_size, const char *filename)
     }
 }
 
-static int qcas_open(BlockDriverState *bs, int flags)
+ int qcas_open(BlockDriverState *bs, int flags)
 {
     BDRVQcasState *s = bs->opaque;
     QCasHeader header;
@@ -184,13 +224,13 @@ fail:
     return ret;
 }
 
-static void qcas_close(BlockDriverState *bs)
+ void qcas_close(BlockDriverState *bs)
 {
     BDRVQcasState *s = bs->opaque;    
     s->qcas_sectors_offset = 0;
 }
 
-static int qcas_create(const char *filename, QEMUOptionParameter *options)
+ int qcas_create(const char *filename, QEMUOptionParameter *options)
 {
     QCasHeader header;
     BlockDriverState* bs;
@@ -233,7 +273,7 @@ static int qcas_create(const char *filename, QEMUOptionParameter *options)
     return ret;
 }
 
-static void hash2fname(const QCasFingerprintBlock *hash_value,
+ void hash2fname(const QCasFingerprintBlock *hash_value,
                        char *filename)
 {
     static unsigned char digitx[] = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -246,13 +286,13 @@ static void hash2fname(const QCasFingerprintBlock *hash_value,
     }
 }
 
-static void form_fname(char *fname, const QCasFingerprintBlock *hash_value)
+ void form_fname(char *fname, const QCasFingerprintBlock *hash_value)
 {
     hash2fname(hash_value, fname);
     strcat(fname, ".raw");
 }
 
-static void rehashing_file(BlockDriverState *bs, 
+ void rehashing_file(BlockDriverState *bs, 
                            BlockDriverState *recipe_bs,
                            uint64_t hash_index,
                            const QCasFingerprintBlock *old_hash_value)
@@ -275,7 +315,7 @@ static void rehashing_file(BlockDriverState *bs,
     assert(ret == QCAS_BLOCK_SIZE);
 //    SHA1Update(&ctx, buffer, QCAS_BLOCK_SIZE);
 //    SHA1Final(new_hash_value.sha1_hash, &ctx);
-    qcas_pseudo_hash(&new_hash_value);
+    qcas_pseudo_hash(&new_hash_value, buffer, QCAS_BLOCK_SIZE);
 
     if (memcmp(old_hash_value->sha1_hash, 
                new_hash_value.sha1_hash,
@@ -326,7 +366,7 @@ static void rehashing_file(BlockDriverState *bs,
     qemu_vfree(buffer);    
 }
 
-static void qcas_co_read_hashfile(const QCasFingerprintBlock *hash_value,
+ void qcas_co_read_hashfile(const QCasFingerprintBlock *hash_value,
                                   uint64_t file_offset,
                                   uint64_t read_size,
                                   uint8_t *in_buffer)
@@ -356,7 +396,7 @@ static void qcas_co_read_hashfile(const QCasFingerprintBlock *hash_value,
     bdrv_close(hf_bs);
 }
 
-static void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
+ void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
                                    uint64_t hash_index,
                                    const QCasFingerprintBlock *hash_value,
                                    uint64_t file_offset,
@@ -410,7 +450,7 @@ static void qcas_co_write_hashfile(BlockDriverState *recipe_bs,
     bdrv_close(hf_bs);   
 }
 
-static coroutine_fn int qcas_co_readv(BlockDriverState *bs, int64_t sector_num,
+ coroutine_fn int qcas_co_readv(BlockDriverState *bs, int64_t sector_num,
                          int nb_sectors, QEMUIOVector *qiov)
 {
     BDRVQcasState *s = bs->opaque;
@@ -446,12 +486,12 @@ static coroutine_fn int qcas_co_readv(BlockDriverState *bs, int64_t sector_num,
                    &hash_value, sizeof(hash_value));
 
         /* dirty hack */
-        if (is_buffer_zerofilled(&hash_value, sizeof(hash_value))) {
-            fprintf(stderr, "QCAS WARNING: detected NULL hash value\n");
-        } else {
-            qcas_co_read_hashfile(&hash_value, file_offset, read_size,
-                                  cluster_data + buffer_pos);
-        }
+        /* if (is_buffer_zerofilled(&hash_value, sizeof(hash_value))) { */
+        /*     fprintf(stderr, "QCAS WARNING: detected NULL hash value\n"); */
+        /* } */
+
+        qcas_co_read_hashfile(&hash_value, file_offset, read_size,
+                              cluster_data + buffer_pos);
         
         current_byte += read_size;
         buffer_pos += read_size;
@@ -471,7 +511,7 @@ static coroutine_fn int qcas_co_readv(BlockDriverState *bs, int64_t sector_num,
     return 0;
 }
 
-static coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
+ coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
                          int nb_sectors, QEMUIOVector *qiov)
 {
     BDRVQcasState *s = bs->opaque;
@@ -563,7 +603,7 @@ static coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
     return 0;
 }
 
-static coroutine_fn int qcas_co_flush(BlockDriverState *bs)
+ coroutine_fn int qcas_co_flush(BlockDriverState *bs)
 {
 //    BDRVQcasState *s = bs->opaque;
     fprintf(stderr, "%s\n", __FUNCTION__);
@@ -571,14 +611,14 @@ static coroutine_fn int qcas_co_flush(BlockDriverState *bs)
 //    return bdrv_co_flush(bs->file);
 }
 
-static coroutine_fn int qcas_co_is_allocated(BlockDriverState *bs,
+ coroutine_fn int qcas_co_is_allocated(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, int *pnum)
 {
     fprintf(stderr, "%s\n", __FUNCTION__);
     return 0;
 }
 
-static int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
+ int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
 {
     BDRVQcasState *s = bs->opaque;
     QCasFingerprintBlock hash_value;
@@ -607,14 +647,14 @@ static int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
     return 0;
 }
 
-static coroutine_fn int qcas_co_discard(BlockDriverState *bs,
+ coroutine_fn int qcas_co_discard(BlockDriverState *bs,
                                         int64_t sector_num, int nb_sectors)
 {
     fprintf(stderr, "%s\n", __FUNCTION__);
     return 0;
 }
 
-static int qcas_truncate(BlockDriverState *bs, int64_t offset)
+ int qcas_truncate(BlockDriverState *bs, int64_t offset)
 {
     fprintf(stderr, "%s\n", __FUNCTION__);
     return 0;
@@ -629,7 +669,7 @@ static QEMUOptionParameter qcas_create_options[] = {
     { NULL }
 };
 
-static int qcas_has_zero_init(BlockDriverState *bs)
+ int qcas_has_zero_init(BlockDriverState *bs)
 {
     //    return bdrv_has_zero_init(bs->file);
     // this funtion must be returning zero!!!!
@@ -637,7 +677,7 @@ static int qcas_has_zero_init(BlockDriverState *bs)
     return 0;
 }
 
-static BlockDriver bdrv_qcas = {
+ BlockDriver bdrv_qcas = {
     .format_name	= "qcas",
     
     .instance_size	= sizeof(BDRVQcasState),
@@ -664,7 +704,7 @@ static BlockDriver bdrv_qcas = {
     .bdrv_has_zero_init = qcas_has_zero_init,
 };
 
-static void bdrv_qcas_init(void)
+ void bdrv_qcas_init(void)
 {
     bdrv_register(&bdrv_qcas);
 }
