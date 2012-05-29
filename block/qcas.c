@@ -237,9 +237,12 @@ static int restore_hash_from_datablkfile(BlockDriverState *bs)
 
     s->qcas_datablk_offset = sizeof(QCasDatablkHeader) +
         (header.fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset));
-    s->fingprt2offset_tbl_idxcount = header.fingprt_offset_index_count;
+    s->fingprt2offset_tbl_idxcount = header.fingprt_offset_index_count;    
     
     s->datablock_maxoffset = header.datablock_maxoffset;
+
+    assert((s->fingprt2offset_tbl_idxcount * QCAS_BLOCK_SIZE)
+           == s->datablock_maxoffset);
 
     if (header.magic != QCAS_MAGIC) {
         ret = -EINVAL;
@@ -260,7 +263,7 @@ static int restore_hash_from_datablkfile(BlockDriverState *bs)
         /* need to validate fingerprint2offset table */
         size_t buf_size = count * sizeof(QCasDatablkFingprtOffset);
         uint32_t crc32_value;
-        QCasDatablkFingprtOffset *tbl_buffer = qemu_vmalloc(buf_size);        
+        QCasDatablkFingprtOffset *tbl_buffer = qemu_vmalloc(buf_size);
         
         assert(tbl_buffer != NULL);
         
@@ -278,14 +281,15 @@ static int restore_hash_from_datablkfile(BlockDriverState *bs)
         }
         
         for (i = 0 ; i < count ; i++) {
-            QCasDatablkFingprtOffset *entry = qemu_vmalloc(sizeof(QCasDatablkFingprtOffset));        
+            QCasDatablkFingprtOffset *entry = qemu_vmalloc(sizeof(QCasDatablkFingprtOffset));
             *entry = tbl_buffer[i];
+            printf("%s: %lld\n", __FUNCTION__, entry->offset);
             ret = ht_insert_fingerprint_and_offset(s, entry);
             assert(ret == 0);
         }
 
         qemu_vfree(tbl_buffer);
-    }   
+    }
 
     ret = 1;
 
@@ -339,11 +343,11 @@ static int qcas_open(BlockDriverState *bs, int flags)
 
     s->qcas_recipe_offset = sizeof(QCasRecipeHeader);
     
-    /* !!! IMPORTANT DO NOT REMOVE !!! */
-    bs->total_sectors = header.total_size / 512;
+    bs->total_sectors = header.total_size / 512; /* !!! IMPORTANT DO NOT REMOVE !!! */
 
     s->sec2fingprt_tbl_idxcount = header.sec_fingprt_index_count;
-    s->sec2fingprt_tbl_length   = header.sec_fingprt_index_count * sizeof(QCasFingerprintBlock);
+    s->sec2fingprt_tbl_length   = 
+      header.sec_fingprt_index_count * sizeof(QCasFingerprintBlock);
     s->sec2fingprt_tbl          = qemu_blockalign(bs, s->sec2fingprt_tbl_length);
     assert(s->sec2fingprt_tbl != NULL);
 
@@ -372,7 +376,7 @@ static int qcas_open(BlockDriverState *bs, int flags)
     crc32_value = qcas_crc32_le((uint8_t*)s->sec2fingprt_tbl, s->sec2fingprt_tbl_length);
     if (header.sec_fingprt_index_crc32 != crc32_value) {
         fprintf(stderr, 
-                "oops the table of sector to fingerprint"
+                "OOPS, the table of sector to fingerprint"
                 " is not valid (crc32 error)\n");
         ret = -EINVAL;
         goto fail;
@@ -417,6 +421,8 @@ static void qcas_close(BlockDriverState *bs)
     uint64_t *p_key;
     QCasRecipeHeader recipe_header;
     QCasDatablkHeader db_header;
+    uint32_t old_fingprt_offset_index_count;
+    uint64_t required_punch_hole_size;
     int i, ret;
     
     assert(s->db_bs != NULL);
@@ -430,12 +436,12 @@ static void qcas_close(BlockDriverState *bs)
     new_crc32_value = qcas_crc32_le((uint8_t*)s->sec2fingprt_tbl, s->sec2fingprt_tbl_length);
 //    new_crc32_value = 0;
     recipe_header.sec_fingprt_index_crc32 = cpu_to_be32(new_crc32_value);
-//    assert(be32_to_cpus(&recipe_header.sec_fingprt_index_count) == s->sec2fingprt_tbl_idxcount);
+    //    assert(be32_to_cpus(&recipe_header.sec_fingprt_index_count) == s->sec2fingprt_tbl_idxcount);
 
     /* restore header for recipe file */
     ret = bdrv_pwrite(s->recipe_bs, 0, &recipe_header, sizeof(recipe_header));
-    /* -13でこれが失敗する */
-    printf("%p (tablesize: %d) ret:%d\n", s->recipe_bs, s->sec2fingprt_tbl_length, ret); 
+    /* -13でこれが失敗する(readvが呼ばれたときに起こってるようであるが... ) */
+    printf("%p (tablesize: %d) ret:%d\n", s->recipe_bs, s->sec2fingprt_tbl_length, ret);
     assert(ret == sizeof(recipe_header));
 
     /* restore the table of fingerprint into disk */
@@ -460,7 +466,7 @@ static void qcas_close(BlockDriverState *bs)
          p_e = ght_next(s->hash_table, &itr, (void*)&p_key), i++) {
         fingprtoffset_buf[i].fingerprint = p_e->fingerprint;
         fingprtoffset_buf[i].offset      = p_e->offset;
-        printf("%s:offset:%lld\n", __FUNCTION__, p_e->offset);
+        printf("%s: offset: %lld\n", __FUNCTION__, p_e->offset);
         qemu_vfree(p_e);
     }
     
@@ -473,17 +479,18 @@ static void qcas_close(BlockDriverState *bs)
        古いデータブロックを下にシフトして新しいテーブルのスペース
        を空けた上でfingprt2offsetのテーブルを書きこまないと...
        現時点でfingprtoffset_bufのテーブル内容は正しい。
+       ここにもんだいがあるな...
     */
     ret = bdrv_pread(s->db_bs, 0, &db_header, sizeof(db_header));
     assert(ret == sizeof(db_header));
-    
-    uint32_t old_fingprt_offset_index_count = db_header.fingprt_offset_index_count;
+        
+    old_fingprt_offset_index_count = db_header.fingprt_offset_index_count;
     be32_to_cpus(&old_fingprt_offset_index_count);
     
-    uint64_t required_punch_hole_size = 
-        (s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset)) -
-        (old_fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset));    
-
+    required_punch_hole_size = 
+      (s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset)) -
+      (old_fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset));
+    
     if (required_punch_hole_size > 0) {
         uint64_t new_size = required_punch_hole_size + bdrv_getlength(s->db_bs);
         uint8_t *cluster_block = qemu_blockalign(bs, QCAS_BLOCK_SIZE);
@@ -495,14 +502,15 @@ static void qcas_close(BlockDriverState *bs)
         for (i = (s->fingprt2offset_tbl_idxcount - 1) ; i >= 0 ; i--) {            
             memset(cluster_block, 0, QCAS_BLOCK_SIZE);
             
-            /* shirt a block */
+            /* shift a block */
             ret = bdrv_pread(s->db_bs, s->qcas_datablk_offset + fingprtoffset_buf[i].offset, 
                              cluster_block, QCAS_BLOCK_SIZE);
             assert(ret == QCAS_BLOCK_SIZE);
-
-            fingprtoffset_buf[i].offset += required_punch_hole_size;
             
-            ret = bdrv_pwrite(s->db_bs, s->qcas_datablk_offset + fingprtoffset_buf[i].offset,
+            // fingprtoffset_buf[i].offset += required_punch_hole_size;
+            
+            ret = bdrv_pwrite(s->db_bs, 
+                              s->qcas_datablk_offset + required_punch_hole_size + fingprtoffset_buf[i].offset,
                               cluster_block, QCAS_BLOCK_SIZE);
             assert(ret == QCAS_BLOCK_SIZE);
         }
@@ -628,7 +636,7 @@ static int qcas_create(const char *filename, QEMUOptionParameter *options)
 
     header_size = sizeof(header);
 
-    sec_fingprt_index_count = (size / QCAS_BLOCK_SIZE) * sizeof(QCasFingerprintBlock);   
+    sec_fingprt_index_count = size / QCAS_BLOCK_SIZE;
     sec2fingprt_tbl_size    = sec_fingprt_index_count * sizeof(QCasFingerprintBlock);
     sec2fingprt_tbl         = qemu_blockalign(recipe_bs, sec2fingprt_tbl_size);
     assert(sec2fingprt_tbl != NULL);
@@ -756,6 +764,10 @@ static void qcas_co_read_hashfile(BlockDriverState *bs,
     
     printf("%s <-> offset: %lld (qcas_datablk_offset: %lld)\n", 
            fname, offset_value->offset, s->qcas_datablk_offset);
+
+    printf("%s %lld (read_size: %lld) \n", __FUNCTION__, 
+           s->qcas_datablk_offset + offset_value->offset + inblock_offset,
+           read_size);
     
     ret = bdrv_pread(s->db_bs, 
                      s->qcas_datablk_offset + offset_value->offset + inblock_offset,
@@ -791,6 +803,7 @@ static void qcas_co_write_hashfile(BlockDriverState *bs,
         s->fingprt2offset_tbl_idxcount++;
         new_block_allocated = 1;
         s->datablock_maxoffset += QCAS_BLOCK_SIZE;
+        printf("%s: %lld\n", __FUNCTION__, offset);
     }
     
     /* ret = bdrv_pread(s->db_bs, data_block_offset, buffer, QCAS_BLOCK_SIZE); */
@@ -1004,6 +1017,10 @@ static int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
 
     size = bs->total_sectors * 512;
     printf("total_bytes: %016llx\n", size);
+
+    fprintf(stderr, 
+            "sector to fingerprint table index: %llu\n", 
+            s->sec2fingprt_tbl_idxcount);
 
     for (i = 0 ; i < s->sec2fingprt_tbl_idxcount ; i++) {
         hash2fname(&s->sec2fingprt_tbl[i], filename);
