@@ -505,9 +505,7 @@ static void qcas_close(BlockDriverState *bs)
             /* shift a block */
             ret = bdrv_pread(s->db_bs, s->qcas_datablk_offset + fingprtoffset_buf[i].offset, 
                              cluster_block, QCAS_BLOCK_SIZE);
-            assert(ret == QCAS_BLOCK_SIZE);
-            
-            // fingprtoffset_buf[i].offset += required_punch_hole_size;
+            assert(ret == QCAS_BLOCK_SIZE);           
             
             ret = bdrv_pwrite(s->db_bs, 
                               s->qcas_datablk_offset + required_punch_hole_size + fingprtoffset_buf[i].offset,
