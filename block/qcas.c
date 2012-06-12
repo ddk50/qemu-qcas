@@ -269,6 +269,18 @@ static int ht_insert_fingerprint_and_offset(BDRVQcasState *s,
                       &offset_value->fingerprint /* key */);
 }
 
+static uint64_t allocate_datablock_offset(BlockDriverState *bs)
+{
+    BDRVQcasState *s = bs->opaque;
+    uint64_t allocated_offset;
+    
+    allocated_offset = s->datablock_maxoffset;
+    s->fingprt2offset_tbl_idxcount++;
+    s->datablock_maxoffset += QCAS_BLOCK_SIZE;
+    
+    return allocated_offset;
+}
+
 static int restore_fingprt2offset_table(BlockDriverState *bs,
                                         QCasDatablkHeader *db_header)
 {
@@ -1096,10 +1108,8 @@ static void qcas_allocate_new_datablock(BlockDriverState *bs,
 #ifdef DEBUG
     int ret;
 #endif
-
-    allocated_offset = s->datablock_maxoffset;
-    s->fingprt2offset_tbl_idxcount++;
-    s->datablock_maxoffset += QCAS_BLOCK_SIZE;
+    
+    allocated_offset = allocate_datablock_offset(bs);
 
     buffer = qemu_blockalign(bs, QCAS_BLOCK_SIZE);
     memset(buffer, 0, QCAS_BLOCK_SIZE);
@@ -1209,9 +1219,7 @@ static void qcas_co_rewrite_datablock(BlockDriverState *bs,
         uint64_t new_offset;
         QCasDatablkFingprtOffset *allocated_offset_value;
         
-        new_offset = s->datablock_maxoffset;
-        s->fingprt2offset_tbl_idxcount++;
-        s->datablock_maxoffset += QCAS_BLOCK_SIZE;
+        new_offset = allocate_datablock_offset(bs);
 
         allocated_offset_value = qemu_vmalloc(sizeof(QCasDatablkFingprtOffset));
         assert(allocated_offset_value != NULL);
