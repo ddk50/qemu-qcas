@@ -29,7 +29,9 @@
 
 #include <ght_hash_table.h>
 
-#define QCAS_MAGIC (('Q' << 24) | ('C' << 16) | ('A' << 8) | 'S')
+#define QCAS_MAGIC        (('Q' << 24) | ('C' << 16) | ('A' << 8) | 'S')
+#define QCAS_DBF_MAGIC    (('Q' << 24) | ('D' << 16) | ('B' << 8) | 'F')
+#define QCAS_F2OTBL_MAGIC (('Q' << 24) | ('F' << 16) | ('2' << 8) | 'O')
 #define QCAS_VERSION 1
 
 #define BDRV_SECTOR_BITS       9
@@ -39,6 +41,7 @@
 #define QCAS_BLOCK_SECTOR (BDRV_SECTORS_PER_CHUNK)
 
 #define QCAS_DATA_FILE  "datablock_file.dbf"
+#define QCAS_FINGPRT2OFFSET_TABLE_FILE "fingprt2offset_table.f2o"
 
 typedef uint64_t qcas_sector_t;
 typedef uint64_t qcas_byte_t;
@@ -76,9 +79,16 @@ typedef struct QCasDatablkHeader {
     uint32_t fingprt_offset_index_crc32;
     uint32_t fingprt_offset_index_count;
     uint64_t datablock_maxoffset;
-    QCasDatablkFingprtOffset fingprt_offset_index[0];
-    /* a table of QCasDatablkFingprtOffset */
+    uint8_t datablock[0];
 } QCasDatablkHeader;
+
+typedef struct QCasFingprtOffsetTblHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t fingprt_offset_index_crc32;
+    uint32_t fingprt_offset_index_count;
+    QCasDatablkFingprtOffset fingprt_offset_entry[0];
+} QCasFingprtOffsetTblHeader;
 
 #define HEADER_SIZE (sizeof(QCasHeader))
 
@@ -88,7 +98,7 @@ typedef struct QCasDatablkHeader {
 #define MAX_FS 30
 
 #define DEBUG
-//#define DEBUG_VERBOSE
+#define DEBUG_VERBOSE
 
 #ifndef DEBUG
 #undef assert
@@ -102,16 +112,18 @@ typedef struct QCasDatablkHeader {
 #endif
 
 typedef struct BDRVQcasState {
-    qcas_sector_t sectors;              /* in sector */
-    qcas_byte_t   total_size;           /* in bytes  */
-    qcas_byte_t   block_size;            /* in bytes  */
-    qcas_byte_t   qcas_recipe_offset;   /* in bytes  */
-    qcas_byte_t   qcas_datablk_offset;  /* in bytes  */
+    qcas_sector_t sectors;                    /* in sector */
+    qcas_byte_t   total_size;                 /* in bytes  */
+    qcas_byte_t   block_size;                 /* in bytes  */
+    qcas_byte_t   qcas_recipe_offset;         /* in bytes  */
+    qcas_byte_t   qcas_datablk_offset;        /* in bytes  */
+    qcas_byte_t   qcas_fingprt2offset_offset; /* in bytes  */
     
     CoMutex lock;
     
     BlockDriverState *recipe_bs;
     BlockDriverState *db_bs;
+    BlockDriverState *fingprt2offset_bs;
 
     QCasFingerprintBlock *sec2fingprt_tbl;
     uint32_t sec2fingprt_tbl_idxcount;
@@ -257,51 +269,29 @@ static int ht_insert_fingerprint_and_offset(BDRVQcasState *s,
                       &offset_value->fingerprint /* key */);
 }
 
-/* データは２つのファイルに格納される */
-/* 1. 一つがrecipeファイル。これにはディスクのsector -> fingerprintの変換表が含まれる */
-/* 2. つがdatablockファイル。これにはfingerprint -> fingerprintのcontextが書かれているoffset部分が含まれる */
-/* 3. fingerprintのデータブロックはvariable-sizeか？とりあえず最初のバージョンではfixed-sizeで */
-static int restore_hash_from_datablkfile(BlockDriverState *bs)
-{    
+static int restore_fingprt2offset_table(BlockDriverState *bs,
+                                        QCasDatablkHeader *db_header)
+{
     BDRVQcasState *s = bs->opaque;
-    QCasDatablkHeader header;
-    int i_buckets = DEFAULT_BACKET_SIZE;
-    int ret, count, i;
+    QCasFingprtOffsetTblHeader header;
+    int ret;
+    int count;
+    
+    assert(s->fingprt2offset_bs != NULL);
 
-    assert(s->db_bs != NULL);
-
-    s->hash_table = ght_create(i_buckets);
-    if (!s->hash_table) {
-        ret = -ENOMEM;
-        goto fail;
-    }
-
-    /* ここでファイルに格納されているcontext -> offsetの表をオン
-       メモリのhashtableにメモリに展開する */
-    ret = bdrv_pread(s->db_bs, 0, &header, sizeof(header));
+    ret = bdrv_pread(s->fingprt2offset_bs, 0, &header, sizeof(header));
     be32_to_cpus(&header.magic);
     be32_to_cpus(&header.version);
-    be64_to_cpus(&header.total_size);
-    be32_to_cpus(&header.blocksize);
     be32_to_cpus(&header.fingprt_offset_index_crc32);
     be32_to_cpus(&header.fingprt_offset_index_count);
-    be64_to_cpus(&header.datablock_maxoffset);
 
-    s->qcas_datablk_offset = sizeof(QCasDatablkHeader) +
-        (header.fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset));
-    s->fingprt2offset_tbl_idxcount = header.fingprt_offset_index_count;    
-    
-    s->datablock_maxoffset = header.datablock_maxoffset;
-    DPRINTF("s->datablock_maxoffset: %lld\n", 
-            s->datablock_maxoffset);
-
-    assert((s->fingprt2offset_tbl_idxcount * QCAS_BLOCK_SIZE)
-           == s->datablock_maxoffset);
-
-    if (header.magic != QCAS_MAGIC) {
+    if (header.magic != QCAS_F2OTBL_MAGIC) {
+        fprintf(stderr, 
+                "Cloud not restore fingerprint to offset table\n");
         ret = -EINVAL;
         goto fail;
     }
+    
     if (header.version != QCAS_VERSION) {
         char version[64];
         snprintf(version, sizeof(version), "QCAS version %d", header.version);
@@ -311,30 +301,42 @@ static int restore_hash_from_datablkfile(BlockDriverState *bs)
         goto fail;
     }
 
-    /* ここの値が前回ヘッダーに保存しておいたものと違う値をとっている */
-    DPRINTF("=========== %s tbl_size: %d ===========\n", 
-            __FUNCTION__, s->fingprt2offset_tbl_idxcount);
+    if (db_header->fingprt_offset_index_crc32 
+        != header.fingprt_offset_index_crc32) {
+        fprintf(stderr, 
+                "Inconsistency CRC32 value for fingerprint "
+                "to offset table between %s and %s\n",
+                QCAS_DATA_FILE, QCAS_FINGPRT2OFFSET_TABLE_FILE);
+        goto fail;
+    }
 
-    /* この値がおかしい？？？ */
+    if (db_header->fingprt_offset_index_count
+        != header.fingprt_offset_index_count) {
+        fprintf(stderr, 
+                "Inconsistency number of index for fingerprint to "
+                "offset table between %s and %s\n",
+                QCAS_DATA_FILE, QCAS_FINGPRT2OFFSET_TABLE_FILE);
+        goto fail;
+    }
+
     count = header.fingprt_offset_index_count;
 
     if (count > 0) {
         /* need to validate fingerprint2offset table */
+        int i;
         size_t buf_size = count * sizeof(QCasDatablkFingprtOffset);
         uint32_t crc32_value;
         QCasDatablkFingprtOffset *tbl_buffer = qemu_vmalloc(buf_size);
         
         assert(tbl_buffer != NULL);
-
-        /* [BUG] このbuf_sizeがなぜか560もの大きさなっている */
+        
         DPRINTF("**** (%s) crc32 for table buf_size: %d ****\n", 
                 __FUNCTION__, buf_size);
         
-        ret = bdrv_pread(s->db_bs, sizeof(QCasDatablkHeader), tbl_buffer, buf_size);
+        ret = bdrv_pread(s->fingprt2offset_bs, sizeof(header), tbl_buffer, buf_size);
         assert(ret == buf_size);
         crc32_value = qcas_crc32_le((uint8_t*)tbl_buffer, buf_size);
         
-        /* ここでバグる */
         if (header.fingprt_offset_index_crc32 != crc32_value) {
             fprintf(stderr, 
                     "oops the table for QCasDatablkFingprtOffset"
@@ -354,21 +356,101 @@ static int restore_hash_from_datablkfile(BlockDriverState *bs)
     }
 
     ret = 1;
+    
+fail:
+    return ret;
+}
+
+static int qcas_open_dbfile(BlockDriverState *bs)
+{
+    BDRVQcasState *s = bs->opaque;
+    QCasDatablkHeader header;
+    BlockDriverState *db_bs;
+    BlockDriverState *fingprt2offset_bs;
+    int i_buckets = DEFAULT_BACKET_SIZE;
+    int ret;
+    
+    ret = bdrv_file_open(&db_bs, QCAS_DATA_FILE, BDRV_O_RDWR);
+    if (ret < 0) {
+        fprintf(stderr, "Could not open qcas %s\n",
+                QCAS_DATA_FILE);
+        goto fail;
+    }
+
+    s->db_bs = db_bs; /* important!! */
+
+    /* ここでファイルに格納されているcontext -> offsetの表をオン
+       メモリのhashtableにメモリに展開する */
+    ret = bdrv_pread(s->db_bs, 0, &header, sizeof(header));
+    be32_to_cpus(&header.magic);
+    be32_to_cpus(&header.version);
+    be64_to_cpus(&header.total_size);
+    be32_to_cpus(&header.blocksize);
+    be32_to_cpus(&header.fingprt_offset_index_crc32);
+    be32_to_cpus(&header.fingprt_offset_index_count);
+    be64_to_cpus(&header.datablock_maxoffset);
+
+    if (header.magic != QCAS_DBF_MAGIC) {
+        fprintf(stderr, 
+                "Cloud not load data block file\n");
+        ret = -EINVAL;
+        goto fail;
+    }
+    
+    if (header.version != QCAS_VERSION) {
+        char version[64];
+        snprintf(version, sizeof(version), "QCAS version %d", header.version);
+        qerror_report(QERR_UNKNOWN_BLOCK_FORMAT_FEATURE,
+                      bs->device_name, "qcas", version);
+        ret = -ENOTSUP;
+        goto fail;
+    }
+
+    s->qcas_datablk_offset         = sizeof(QCasDatablkHeader);
+    s->datablock_maxoffset         = header.datablock_maxoffset;
+    s->fingprt2offset_tbl_idxcount = header.fingprt_offset_index_count;
+
+    /* Thirdly, restore fingerprint to offset table from file */
+    ret = bdrv_file_open(&fingprt2offset_bs, QCAS_FINGPRT2OFFSET_TABLE_FILE, BDRV_O_RDWR);
+    if (ret < 0) {
+        fprintf(stderr, "could not open qcas %s\n",
+                QCAS_FINGPRT2OFFSET_TABLE_FILE);
+        goto fail;
+    }
+    
+    s->fingprt2offset_bs = fingprt2offset_bs; /* important!! */
+    
+    s->hash_table = ght_create(i_buckets);
+    if (!s->hash_table) {
+        ret = -ENOMEM;
+        goto fail;
+    }
+
+    s->qcas_fingprt2offset_offset = sizeof(QCasFingprtOffsetTblHeader);
+    ret = restore_fingprt2offset_table(bs, &header);
+    if (ret < 0) {
+        goto fail;
+    }
+    
+    ret = 1;
+
+    return ret;
 
 fail:
+    bdrv_close(db_bs);
     return ret;
 }
 
 static int qcas_open(BlockDriverState *bs, int flags)
 {
     BDRVQcasState *s = bs->opaque;
-    BlockDriverState *db_bs;
     QCasRecipeHeader header;
     uint32_t crc32_value;
     int ret;
 
     assert(QCAS_BLOCK_SIZE % 512 == 0);
 
+    /* Firstly, Read recipe file */
     s->recipe_bs = bs->file;
     
     ret = bdrv_pread(s->recipe_bs, 0, &header, sizeof(header));
@@ -408,26 +490,10 @@ static int qcas_open(BlockDriverState *bs, int flags)
     bs->total_sectors = header.total_size / 512; /* !!! IMPORTANT DO NOT REMOVE !!! */
 
     s->sec2fingprt_tbl_idxcount = header.sec_fingprt_index_count;
-    s->sec2fingprt_tbl_length   = 
-      header.sec_fingprt_index_count * sizeof(QCasFingerprintBlock);
+    s->sec2fingprt_tbl_length   = header.sec_fingprt_index_count * sizeof(QCasFingerprintBlock);
     s->sec2fingprt_tbl          = qemu_blockalign(bs, s->sec2fingprt_tbl_length);
     assert(s->sec2fingprt_tbl != NULL);
-
-    /* 
-       TODO
-       DONE: openの挙動時
-       DONE: datablk:を開く。
-       DONE: すべてのfingerprint -> offsetのテーブルをオンメモリに展開
-     */
-    ret = bdrv_file_open(&db_bs, QCAS_DATA_FILE, BDRV_O_RDWR);
-    if (ret < 0) {
-        fprintf(stderr, "could not open qcas datafile\n");
-        return ret;
-    }
     
-    s->recipe_bs = bs->file;
-    s->db_bs = db_bs;
-
     /* restore table for sector to offset into on the memory */
     ret = bdrv_pread(s->recipe_bs, s->qcas_recipe_offset, 
                      s->sec2fingprt_tbl, s->sec2fingprt_tbl_length);
@@ -442,13 +508,16 @@ static int qcas_open(BlockDriverState *bs, int flags)
                 " is not valid (crc32 error)\n");
         ret = -EINVAL;
         goto fail;
-    }
-    
-    ret = restore_hash_from_datablkfile(bs);
+    }   
+
+    /* end of reading recipe file */
+
+    /* Secondly, reading datablock file */
+    ret = qcas_open_dbfile(bs);
     if (ret < 0) {
         goto fail;
-    }   
-    /* end of hash value */
+    }
+    /* end of reading datablock file */
 
     /* Initialise locks */
     qemu_co_mutex_init(&s->lock);
@@ -458,8 +527,11 @@ static int qcas_open(BlockDriverState *bs, int flags)
     assert(s->block_size != 0);
     assert(s->qcas_recipe_offset != 0);
     assert(s->qcas_datablk_offset != 0);
+    assert(s->qcas_fingprt2offset_offset != 0);
+    assert(s->fingprt2offset_bs != 0);
     assert(s->recipe_bs != NULL);
     assert(s->db_bs != NULL);
+    assert(s->fingprt2offset_bs != NULL);
     assert(s->sec2fingprt_tbl != NULL);
     assert(s->sec2fingprt_tbl != NULL);
     assert(s->sec2fingprt_tbl_idxcount != 0);
@@ -469,7 +541,6 @@ static int qcas_open(BlockDriverState *bs, int flags)
     return 0;    
     
 fail:
-    bdrv_close(db_bs);
     return ret;
 }
 
@@ -484,8 +555,9 @@ static void qcas_close(BlockDriverState *bs)
     uint64_t *p_key;
     QCasRecipeHeader recipe_header;
     QCasDatablkHeader db_header;
-    uint32_t old_fingprt_offset_index_count;
-    uint64_t required_punch_hole_size;
+    QCasFingprtOffsetTblHeader fpotbl_header;
+//    uint32_t old_fingprt_offset_index_count;
+//    uint64_t required_punch_hole_size;
     int i;
 #ifdef DEBUG
     int ret;
@@ -493,6 +565,7 @@ static void qcas_close(BlockDriverState *bs)
     
     assert(s->db_bs != NULL);
     assert(s->recipe_bs != NULL);
+    assert(s->fingprt2offset_bs != NULL);
 
     if (s->recipe_bs->read_only) {
         /* No need to re-construct the header */
@@ -553,33 +626,27 @@ static void qcas_close(BlockDriverState *bs)
 #endif
 
 //    
-//    assert(ght_size(s->hash_table) == s->fingprt2offset_tbl_idxcount);
+//  assert(ght_size(s->hash_table) == s->fingprt2offset_tbl_idxcount);
 //  ght_sizeはどうも要素数を表しているわけではないらしい  
 // 
     tbl_size = s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset);
     fingprtoffset_buf = qemu_blockalign(bs, tbl_size);
-    assert(fingprtoffset_buf != NULL);    
+    assert(fingprtoffset_buf != NULL);
 
     /* need to restore hashtable entries to disk and free them */
     for (p_e = ght_first(s->hash_table, &itr, (void*)&p_key), i = 0 ; p_e ; 
          p_e = ght_next(s->hash_table, &itr, (void*)&p_key), i++) {
         fingprtoffset_buf[i].fingerprint = p_e->fingerprint;
         fingprtoffset_buf[i].offset      = p_e->offset;
-        DPRINTF("%s: offset: %lld\n", __FUNCTION__, p_e->offset);
         qemu_vfree(p_e);
     }
     
-//    assert(i == s->fingprt2offset_tbl_idxcount);p
+//    assert(i == s->fingprt2offset_tbl_idxcount);
     
     ght_finalize(s->hash_table);
     
     /* recontruct header of dbfile */
-    /* 
-       古いデータブロックを下にシフトして新しいテーブルのスペース
-       を空けた上でfingprt2offsetのテーブルを書きこまないと...
-       現時点でfingprtoffset_bufのテーブル内容は正しい。
-       ここにもんだいがあるな...
-    */
+    /* datablock_file.dbfの一番下にfingerprint2offsetのテーブルの記録をぶち込む。*/
 #ifdef DEBUG
     ret = bdrv_pread(s->db_bs, 0, &db_header, sizeof(db_header));
     assert(ret == sizeof(db_header));
@@ -587,54 +654,54 @@ static void qcas_close(BlockDriverState *bs)
     bdrv_pread(s->db_bs, 0, &db_header, sizeof(db_header));
 #endif
         
-    old_fingprt_offset_index_count = db_header.fingprt_offset_index_count;
-    be32_to_cpus(&old_fingprt_offset_index_count);
+/*     old_fingprt_offset_index_count = db_header.fingprt_offset_index_count; */
+/*     be32_to_cpus(&old_fingprt_offset_index_count); */
     
-    required_punch_hole_size = 
-      (s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset)) -
-      (old_fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset));
+/*     required_punch_hole_size =  */
+/*       (s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset)) - */
+/*       (old_fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset)); */
     
-    if (required_punch_hole_size > 0) {
-        uint64_t new_size = required_punch_hole_size + bdrv_getlength(s->db_bs);
-        uint8_t *cluster_block = qemu_blockalign(bs, QCAS_BLOCK_SIZE);
-        assert(cluster_block != NULL);
+/*     if (required_punch_hole_size > 0) { */
+/*         uint64_t new_size = required_punch_hole_size + bdrv_getlength(s->db_bs); */
+/*         uint8_t *cluster_block = qemu_blockalign(bs, QCAS_BLOCK_SIZE); */
+/*         assert(cluster_block != NULL); */
         
-        bdrv_truncate(s->db_bs, new_size);
-#ifdef DEBUG_VERBOSE
-        DPRINTF("required_punch_hole_size: %lld\n", required_punch_hole_size);
-        DPRINTF("maxoffset: %lld -- new_size: %lld\n", s->datablock_maxoffset, new_size);
-#endif        
-        /* NEED to shift data blocks to allocate fingprt2offset table */
-        for (i = (s->fingprt2offset_tbl_idxcount - 1) ; i >= 0 ; i--) {    
-            uint64_t old_db_goffset;
-            uint64_t new_db_goffset;
+/*         bdrv_truncate(s->db_bs, new_size); */
+/* #ifdef DEBUG_VERBOSE */
+/*         DPRINTF("required_punch_hole_size: %lld\n", required_punch_hole_size); */
+/*         DPRINTF("maxoffset: %lld -- new_size: %lld\n", s->datablock_maxoffset, new_size); */
+/* #endif         */
+/*         /\* NEED to shift data blocks to allocate fingprt2offset table *\/ */
+/*         for (i = (s->fingprt2offset_tbl_idxcount - 1) ; i >= 0 ; i--) {     */
+/*             uint64_t old_db_goffset; */
+/*             uint64_t new_db_goffset; */
             
-            memset(cluster_block, 0, QCAS_BLOCK_SIZE);
+/*             memset(cluster_block, 0, QCAS_BLOCK_SIZE); */
 
-            old_db_goffset = s->qcas_datablk_offset + fingprtoffset_buf[i].offset;
-            new_db_goffset = s->qcas_datablk_offset + required_punch_hole_size + fingprtoffset_buf[i].offset;
+/*             old_db_goffset = s->qcas_datablk_offset + fingprtoffset_buf[i].offset; */
+/*             new_db_goffset = s->qcas_datablk_offset + required_punch_hole_size + fingprtoffset_buf[i].offset; */
             
-            /* shift data blocks */
-#ifdef DEBUG
-            ret = bdrv_pread(s->db_bs, old_db_goffset,
-                             cluster_block, QCAS_BLOCK_SIZE);
-            assert(ret == QCAS_BLOCK_SIZE);
+/*             /\* shift data blocks *\/ */
+/* #ifdef DEBUG */
+/*             ret = bdrv_pread(s->db_bs, old_db_goffset, */
+/*                              cluster_block, QCAS_BLOCK_SIZE); */
+/*             assert(ret == QCAS_BLOCK_SIZE); */
             
-            ret = bdrv_pwrite(s->db_bs, 
-                              new_db_goffset,
-                              cluster_block, QCAS_BLOCK_SIZE);
-            assert(ret == QCAS_BLOCK_SIZE);
-#else
-            bdrv_pread(s->db_bs, old_db_goffset, 
-                       cluster_block, QCAS_BLOCK_SIZE);
-            bdrv_pwrite(s->db_bs, 
-                        new_db_goffset,
-                        cluster_block, QCAS_BLOCK_SIZE);
-#endif
-        }
+/*             ret = bdrv_pwrite(s->db_bs,  */
+/*                               new_db_goffset, */
+/*                               cluster_block, QCAS_BLOCK_SIZE); */
+/*             assert(ret == QCAS_BLOCK_SIZE); */
+/* #else */
+/*             bdrv_pread(s->db_bs, old_db_goffset,  */
+/*                        cluster_block, QCAS_BLOCK_SIZE); */
+/*             bdrv_pwrite(s->db_bs,  */
+/*                         new_db_goffset, */
+/*                         cluster_block, QCAS_BLOCK_SIZE); */
+/* #endif */
+/*         } */
 
-        qemu_vfree(cluster_block);
-    }
+/*         qemu_vfree(cluster_block); */
+/*     } */
 
     DPRINTF("**** (%s) crc32 for table buf_size: %d ****\n", 
             __FUNCTION__, tbl_size);
@@ -643,40 +710,64 @@ static void qcas_close(BlockDriverState *bs)
     db_header.fingprt_offset_index_count = cpu_to_be32(s->fingprt2offset_tbl_idxcount);
     db_header.datablock_maxoffset        = cpu_to_be64(s->datablock_maxoffset);
     
-    /* write header to file */
-#ifdef DEBUG
-    ret = bdrv_pwrite(s->db_bs, 0, &db_header, sizeof(db_header));
-    assert(ret == sizeof(db_header));    
-#else
-    bdrv_pwrite(s->db_bs, 0, &db_header, sizeof(db_header));
-#endif
-    
-#ifdef DEBUG
-    ret = bdrv_pwrite(s->db_bs, sizeof(db_header), fingprtoffset_buf, tbl_size);    
-    assert(ret == tbl_size);
-#else
-    bdrv_pwrite(s->db_bs, sizeof(db_header), fingprtoffset_buf, tbl_size);
-#endif
-    
-    qemu_vfree(fingprtoffset_buf);
-
+    /* re-write header to data block file */
 #ifdef DEBUG
     ret = bdrv_pwrite(s->db_bs, 0, &db_header, sizeof(db_header));
     assert(ret == sizeof(db_header));
-
-    be32_to_cpus(&db_header.fingprt_offset_index_count);
-    
-    printf("**** (%s) db_header.fingprt_offset_index_count: %d ****\n", 
-           __FUNCTION__, db_header.fingprt_offset_index_count);
+#else
+    bdrv_pwrite(s->db_bs, 0, &db_header, sizeof(db_header));
 #endif
+    /* end of re-writing header to data block file */    
+    
+    /* re-construct fingprt2offset table */
+#ifdef DEBUG
+    ret = bdrv_pread(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
+    assert(ret == sizeof(fpotbl_header));
+#else
+    ret = bdrv_pread(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
+#endif
+
+    fpotbl_header.fingprt_offset_index_crc32 = cpu_to_be32(new_crc32_value);
+    fpotbl_header.fingprt_offset_index_count = cpu_to_be32(s->fingprt2offset_tbl_idxcount);    
+
+    /* double check */
+    assert(fpotbl_header.fingprt_offset_index_crc32 == db_header.fingprt_offset_index_crc32);   
+    assert(fpotbl_header.fingprt_offset_index_count == db_header.fingprt_offset_index_count);
+
+    /* write fingprt2offset table header */
+#ifdef DEBUG
+    ret = bdrv_pwrite(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
+    assert(ret == sizeof(fpotbl_header));
+#else
+    bdrv_pwrite(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
+#endif    
+    /* end of writing fingprt2offset table header */
+
+
+    /* write fingprt2offset table */
+#ifdef DEBUG
+    ret = bdrv_pwrite(s->fingprt2offset_bs, sizeof(fpotbl_header), 
+                      fingprtoffset_buf, tbl_size);
+    assert(ret == tbl_size);
+#else
+    bdrv_pwrite(s->fingprt2offset_bs, sizeof(fpotbl_header),
+                fingprtoffset_buf, tbl_size);
+#endif    
+    qemu_vfree(fingprtoffset_buf);
+    /* write fingprt2offset table */
+    /* End of re-constructing fingprt2offset table */
     
     s->qcas_recipe_offset  = 0;
     s->qcas_datablk_offset = 0;
+    s->qcas_fingprt2offset_offset = 0;
     
-exit:
-    
+exit:    
     bdrv_close(s->db_bs);
+    bdrv_close(s->fingprt2offset_bs);
+
     s->db_bs = NULL;
+    s->recipe_bs = NULL;
+    s->fingprt2offset_bs = NULL;
 }
 
 static int qcas_create_datablk(uint64_t total_size, uint32_t block_size)
@@ -695,6 +786,18 @@ static int qcas_create_datablk(uint64_t total_size, uint32_t block_size)
       |   fingprt_offset_index_crc32   |
       +--------------------------------+
       |   fingprt_offset_index_count   |
+      +--------------------------------+
+      |       datablock_maxoffset      |
+      +--------------------------------+
+      |      datablock_tailoffset      |
+      +--------------------------------+
+      |            data_1              |
+      +--------------------------------+
+      |            data_2              |
+      +--------------------------------+
+      |            data_3              |
+      +--------------------------------+
+      |            data_n              |
       +----------------------+---------+
       | fingprt_hash_value_1 | offset  |
       +----------------------+---------+
@@ -715,7 +818,7 @@ static int qcas_create_datablk(uint64_t total_size, uint32_t block_size)
 
     /* first, we make a header */
     memset(&header, 0, sizeof(header));
-    header.magic                      = cpu_to_be32(QCAS_MAGIC);
+    header.magic                      = cpu_to_be32(QCAS_DBF_MAGIC);
     header.version                    = cpu_to_be32(QCAS_VERSION);
     header.total_size                 = cpu_to_be64(total_size);
     header.blocksize                  = cpu_to_be32(block_size);
@@ -738,10 +841,48 @@ static int qcas_create_datablk(uint64_t total_size, uint32_t block_size)
     if (ret < 0) {
         goto exit;
     }
+
+    ret = 0;
     
 exit:
     bdrv_close(db_bs);
     return ret;
+}
+
+static int qcas_create_fingprtoffset_tbl_file(void)
+{
+    QCasFingprtOffsetTblHeader header;
+    BlockDriverState *fingprt2offset_bs;
+    int ret;
+
+    memset(&header, 0, sizeof(header));
+    header.magic                        = cpu_to_be32(QCAS_F2OTBL_MAGIC);
+    header.version                      = cpu_to_be32(QCAS_VERSION);
+    header.fingprt_offset_index_crc32   = cpu_to_be32(0); /* firstly 0 */
+    header.fingprt_offset_index_count   = cpu_to_be32(0); /* firstly 0 */
+
+    ret = bdrv_create_file(QCAS_FINGPRT2OFFSET_TABLE_FILE, NULL);
+    if (ret < 0) {
+        goto exit;
+    }
+
+    ret = bdrv_file_open(&fingprt2offset_bs, 
+                         QCAS_FINGPRT2OFFSET_TABLE_FILE, BDRV_O_RDWR);
+    if (ret < 0) {
+        goto exit;
+    }
+    
+    /* First, writing header */
+    ret = bdrv_pwrite(fingprt2offset_bs, 0, &header, sizeof(header));
+    if (ret < 0) {
+        goto exit;
+    }
+
+    ret = 0;
+    
+exit:
+    bdrv_close(fingprt2offset_bs);
+    return ret;    
 }
 
 static int qcas_create(const char *filename, QEMUOptionParameter *options)
@@ -802,8 +943,14 @@ static int qcas_create(const char *filename, QEMUOptionParameter *options)
         goto exit;
     }
 
-    /* NEED to create data block size */
+    /* NEED to create data block file */
     ret = qcas_create_datablk(size, QCAS_BLOCK_SIZE);
+    if (ret < 0) {
+        goto exit;
+    }
+
+    /* NEED to create Fingerprint2offset table file */
+    ret = qcas_create_fingprtoffset_tbl_file();
     if (ret < 0) {
         goto exit;
     }
@@ -900,7 +1047,7 @@ void rehashing_file(BlockDriverState *bs,
                       block_buffer, block_buffer_len);
     assert(ret == block_buffer_len);
 #else
-    bdrv_pwrite(s->db_bs,    
+    bdrv_pwrite(s->db_bs, 
                 s->qcas_datablk_offset + offset,
                 block_buffer, block_buffer_len);
 #endif
@@ -990,7 +1137,7 @@ static void qcas_allocate_new_datablock(BlockDriverState *bs,
                       buffer, QCAS_BLOCK_SIZE);
     assert(ret == QCAS_BLOCK_SIZE);
 #else
-    bdrv_pwrite(s->db_bs,    
+    bdrv_pwrite(s->db_bs,
                 s->qcas_datablk_offset + allocated_offset,
                 buffer, QCAS_BLOCK_SIZE);
 #endif
@@ -1276,6 +1423,7 @@ static int qcas_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
     
     assert(s->qcas_recipe_offset != 0);
     assert(s->qcas_datablk_offset != 0);
+    assert(s->qcas_fingprt2offset_offset != 0);
     assert(bs->total_sectors != 0);
 
     size = bs->total_sectors * 512;
@@ -1355,4 +1503,5 @@ static void bdrv_qcas_init(void)
 }
 
 block_init(bdrv_qcas_init);
+
 
