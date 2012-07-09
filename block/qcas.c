@@ -97,8 +97,8 @@ typedef struct QCasFingprtOffsetTblHeader {
 
 #define MAX_FS 30
 
-#define DEBUG
-#define DEBUG_VERBOSE
+//#define DEBUG
+//#define DEBUG_VERBOSE
 
 #ifndef DEBUG
 #undef assert
@@ -724,7 +724,7 @@ static void qcas_close(BlockDriverState *bs)
     ret = bdrv_pread(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
     assert(ret == sizeof(fpotbl_header));
 #else
-    ret = bdrv_pread(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
+    bdrv_pread(s->fingprt2offset_bs, 0, &fpotbl_header, sizeof(fpotbl_header));
 #endif
 
     fpotbl_header.fingprt_offset_index_crc32 = cpu_to_be32(new_crc32_value);
