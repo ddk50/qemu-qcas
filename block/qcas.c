@@ -35,9 +35,9 @@
 #define QCAS_VERSION 1
 
 #define BDRV_SECTOR_BITS       9
+//#define BDRV_SECTORS_PER_CHUNK 4096 // (4096 -> 2MB)
 #define BDRV_SECTORS_PER_CHUNK 2048 // (2048 -> 1MB)
-//#define BDRV_SECTORS_PER_CHUNK 8 // (8 -> 4KB) too late
-//#define BDRV_SECTORS_PER_CHUNK 512
+//#define BDRV_SECTORS_PER_CHUNK 8 // (8 -> 4KB)
 
 #define QCAS_BLOCK_SIZE   (BDRV_SECTORS_PER_CHUNK << BDRV_SECTOR_BITS)
 #define QCAS_BLOCK_SECTOR (BDRV_SECTORS_PER_CHUNK)
@@ -69,7 +69,7 @@ typedef struct QCasDatablkFingprtOffset {
 } QCasDatablkFingprtOffset;
 
 /* QCasRecipeHeaderにはsector -> fingerprintの表が含まれている */
-typedef struct QCasRecipeHeader {
+typedef struct QCasRecipeHeader {    
     uint32_t magic;
     uint32_t version;
     qcas_byte_t total_size;  /* in bytes */
@@ -459,6 +459,8 @@ static int qcas_open_dbfile(BlockDriverState *bs)
     }
     
     ret = 1;
+
+    printf("QCAS_BLOCK_SIZE: %lf [MBytes]\n", QCAS_BLOCK_SIZE / 1024.0 / 1024.0);
 
     return ret;
 
@@ -1018,7 +1020,7 @@ void form_fname(char *fname, const QCasFingerprintBlock *hash_value)
 static void qcas_co_do_calculate_fingerprint(BlockDriverState *bs,
                                              QCasRecipeSector2Fingprt *hash_value,
                                              uint64_t inblock_offset,
-                                             uint64_t read_size,                                  
+                                             uint64_t read_size,
                                              uint8_t *out_buffer,
                                              uint64_t current_byte)
 {
@@ -1076,6 +1078,7 @@ static void qcas_co_do_calculate_fingerprint(BlockDriverState *bs,
                                 &hash_value->fingerprint))) {
         /* すでにL2内に同一ハッシュが登録されているので追加しなくてもよい */
         inc_refcount(offset_value);
+        hash_value->offset = offset_value->offset;
     } else {
         /* L2内では新しいデータなので追加する */
         new_fingprt2offset_entry = qemu_vmalloc(sizeof(QCasDatablkFingprtOffset));
@@ -1260,12 +1263,25 @@ static void qcas_co_overwrite_datablock_without_fingprt(BlockDriverState *bs,
                                                         uint64_t write_size,
                                                         const uint8_t *in_buffer)
 {
+    BDRVQcasState *s = bs->opaque;
+#ifdef DEBUG
+    int ret;
+#endif
+    
     /* SHA1未計算ブロックに対して再び書き込みが行われている */
     assert(is_nullhash(hash_value));
     assert(hash_value->offset != SEC2FINGPRT_NOTWRITTEN);
     
-    qcas_copy_block_to_newblock(bs, hash_value, inblock_offset,
-                                write_size, in_buffer);
+#ifdef DEBUG
+    ret = bdrv_pwrite(s->db_bs,
+                      s->qcas_datablk_offset + hash_value->offset + inblock_offset,
+                      in_buffer, write_size);
+    assert(ret == write_size);
+#else
+    bdrv_pwrite(s->db_bs,
+                s->qcas_datablk_offset + hash_value->offset + inblock_offset,
+                in_buffer, write_size);
+#endif
     
 }
 
@@ -1278,12 +1294,13 @@ static void qcas_co_overwrite_datablock(BlockDriverState *bs,
     BDRVQcasState *s = bs->opaque;
     QCasDatablkFingprtOffset *offset_value;
     char ascii_hash[41] = {0};
+#ifdef DEBUG
+    int ret;
+#endif
 
     /*
-      つまりリライトがかかってる。
-      しかし、すでにSHA-1は計算済みである。
+      リライトがかかってる、しかし、すでにSHA-1は計算済みである。
     */
-    
     assert(!is_nullhash(hash_value));
     assert(hash_value->offset != SEC2FINGPRT_NOTWRITTEN);
     
@@ -1298,23 +1315,35 @@ static void qcas_co_overwrite_datablock(BlockDriverState *bs,
                 ascii_hash);
         abort();
     }
+
+    if (offset_value->ref_count >= 2) {
+        qcas_copy_block_to_newblock(bs, hash_value, inblock_offset,
+                                    write_size, in_buffer);
+    } else {
+#ifdef DEBUG
+        if (hash_value->offset != offset_value->offset) {
+            fprintf(stderr, 
+                    "Inconsistency offset value between L1 and L2\n"
+                    "L1 (set2fingprt) table offset is %llu\n"
+                    "L2 (fingprt2offset) table offset is %llu\n",
+                    hash_value->offset,
+                    offset_value->offset);
+        }
+#endif
+#ifdef DEBUG
+        /* とにかくディスクに書きこんでしまう */
+        ret = bdrv_pwrite(s->db_bs,
+                          s->qcas_datablk_offset + hash_value->offset + inblock_offset,
+                          in_buffer, write_size);
+        assert(ret == write_size);
+#else
+        bdrv_pwrite(s->db_bs,
+                    s->qcas_datablk_offset + hash_value->offset + inblock_offset,
+                    in_buffer, write_size);
+#endif        
+    }
     
-    qcas_copy_block_to_newblock(bs, hash_value, inblock_offset,
-                                write_size, in_buffer);
-
     dec_refcount(offset_value);
-
-/* #ifdef DEBUG */
-/*     /\* とにかくディスクに書きこんでしまう *\/ */
-/*     ret = bdrv_pwrite(s->db_bs, */
-/*                       s->qcas_datablk_offset + hash_value->offset + inblock_offset, */
-/*                       in_buffer, write_size); */
-/*     assert(ret == write_size); */
-/* #else */
-/*     bdrv_pwrite(s->db_bs,     */
-/*                 s->qcas_datablk_offset + hash_value->offset + inblock_offset, */
-/*                 in_buffer, write_size); */
-/* #endif */
     
     /* SHA-1再計算待ちであることを示すため、fingerprintは再びNULLに */
     memset(&hash_value->fingerprint, 0, sizeof(QCasFingerprintBlock));
@@ -1466,7 +1495,7 @@ static coroutine_fn int qcas_co_writev(BlockDriverState *bs, int64_t sector_num,
             qcas_co_overwrite_datablock_without_fingprt(bs, hash_value, file_offset, 
                                                         write_size, 
                                                         cluster_data + buffer_pos);
-        } else {
+        } else if {
             /* SHA1計算済みブロックに対してリライトが行われている */
             qcas_co_overwrite_datablock(bs, hash_value, file_offset, write_size,
                                         cluster_data + buffer_pos);
