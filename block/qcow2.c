@@ -149,8 +149,6 @@ static int qcow2_open(BlockDriverState *bs, int flags)
     uint64_t ext_end;
     bool writethrough;
 
-    printf("fuck you: %s: %s\n", __FUNCTION__, bs->device_name);
-
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
         goto fail;

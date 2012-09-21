@@ -22,6 +22,13 @@
 /* macro */
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
+#if defined(_WIN32)
+# define QEMU_PACKED __attribute__((gcc_struct, packed))
+#else
+# define QEMU_PACKED __attribute__((packed))
+#endif
+
+
 /* TODO: qemu_co_mutex_initを実装 */
 
 #define BDRV_O_RDWR        0x0002
@@ -86,6 +93,10 @@ typedef struct BlockDriverInfo {
     void *padding;
 } BlockDriverInfo;
 
+typedef struct QEMUSnapshotInfo {
+    void *padding;
+} QEMUSnapshotInfo;
+
 typedef struct BlockDriver {
     const char *format_name;
     int instance_size;
@@ -107,6 +118,15 @@ typedef struct BlockDriver {
 
     int (*bdrv_truncate)(BlockDriverState *bs, int64_t offset);
 
+    int (*bdrv_snapshot_create)(BlockDriverState *bs,
+                                QEMUSnapshotInfo *sn_info);
+    int (*bdrv_snapshot_goto)(BlockDriverState *bs,
+                              const char *snapshot_id);
+    int (*bdrv_snapshot_delete)(BlockDriverState *bs, const char *snapshot_id);
+    int (*bdrv_snapshot_list)(BlockDriverState *bs,
+                              QEMUSnapshotInfo **psn_info);
+    int (*bdrv_snapshot_load_tmp)(BlockDriverState *bs,
+                                  const char *snapshot_name);
     int (*bdrv_get_info)(BlockDriverState *bs, BlockDriverInfo *bdi);
 
     int (*bdrv_create)(const char *filename, QEMUOptionParameter *options);
