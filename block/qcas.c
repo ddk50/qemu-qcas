@@ -108,7 +108,7 @@ typedef struct QEMU_PACKED QCasDatablkHeader {
     uint32_t blocksize;
     uint32_t fingprt_offset_index_crc32;
     uint32_t fingprt_offset_index_count;
-    uint64_t datablock_maxoffset;
+    uint64_t datablock_maxoffset;   
     uint8_t datablock[0];
 } QCasDatablkHeader;
 
@@ -120,12 +120,23 @@ typedef struct QEMU_PACKED QCasFingprtOffsetTblHeader {
     QCasDatablkFingprtOffset fingprt_offset_entry[0];
 } QCasFingprtOffsetTblHeader;
 
-typedef struct QEMU_PACKED QCowSnapshotHeader {
+typedef struct QEMU_PACKED QCasSnapshotHeader {
+    uint64_t l1_table_offset;
+    uint32_t l1_size;
+
+    uint16_t id_str_size;
+    uint16_t name_size;
+
     uint32_t date_sec;
     uint32_t date_nsec;
+    
     uint64_t vm_clock_nsec;
-    uint32_t vm_state_size;
-} QCowSnapshotHeader;
+    uint32_t vm_state_size;   
+    
+    /* id_str follows */
+    /* name follows  */
+    QCasRecipeSector2Fingprt l1_table[0]; /* l1_table follows */
+} QCasSnapshotHeader;
 
 #define HEADER_SIZE (sizeof(QCasHeader))
 
@@ -134,7 +145,7 @@ typedef struct QEMU_PACKED QCowSnapshotHeader {
 
 #define MAX_FS 30
 
-#define DEBUG
+//#define DEBUG
 //#define DEBUG_VERBOSE
 
 #ifndef DEBUG
@@ -149,12 +160,18 @@ typedef struct QEMU_PACKED QCowSnapshotHeader {
 #endif
 
 typedef struct QCasSnapshot {
+    uint64_t l1_table_offset;
+    uint32_t l1_size;
+
     char *id_str;
     char *name;
+    
     uint64_t vm_state_size;
+    uint64_t vm_clock_nsec;
+    
     uint32_t date_sec;
     uint32_t date_nsec;
-    uint64_t vm_clock_nsec;
+    
 } QCasSnapshot;
 
 typedef struct BDRVQcasState {
@@ -173,13 +190,14 @@ typedef struct BDRVQcasState {
 
     QCasRecipeSector2Fingprt *sec2fingprt_tbl;
     uint32_t sec2fingprt_tbl_idxcount;
-    size_t sec2fingprt_tbl_length;
+    uint64_t sec2fingprt_tbl_length;
 
     ght_hash_table_t *hash_table;
     uint32_t fingprt2offset_tbl_idxcount;
     uint64_t datablock_maxoffset;
 
-    uint32_t nb_snapshot;
+    uint64_t snapshots_offset;
+    uint32_t nb_snapshots;
     QCasSnapshot *snapshots;
     
     QLIST_HEAD(QCasFreeblk, QCasFreeBlockoffset) freeblock_list;
@@ -189,6 +207,7 @@ typedef struct BDRVQcasState {
 void form_fname(char *fname, const QCasFingerprintBlock *l1_entry);
 void print_raw_recipe_header(QCasRecipeHeader *cas_recipe_header);
 void print_hash(QCasFingerprintBlock *hash, const char *func_name);
+char *qcas_strdup(const char *str);
 
 int check_internal_data_status(BlockDriverState *bs,
                                const QCasRecipeSector2Fingprt *canonical_l1_entries,
@@ -199,14 +218,14 @@ int check_internal_data_status(BlockDriverState *bs,
 static void hash2fname(const QCasFingerprintBlock *l1_entry,
                        char *filename);
 static int is_nullhash(const QCasRecipeSector2Fingprt *l1_entry);
-static int __is_nullhash(const QCasFingerprintBlock *hash_value);
 static int is_hash_calclated(const QCasRecipeSector2Fingprt *l1_entry);
 
-void qcas_dump_L2(BlockDriverState *bs);
-void qcas_dump_L1_and_L2(BlockDriverState *bs, 
-                         uint64_t sector_num, int nb_sectors);
+int __is_nullhash(const QCasFingerprintBlock *hash_value);
 
 int is_writting_to_zerofilled_region(QCasRecipeSector2Fingprt *l1_entry);
+
+void dump_refcount_status(QCasDatablkFingprtOffset *datablk,
+                          int increment);
 /**********************************************************************/
 
 void print_hash(QCasFingerprintBlock *hash, const char *func_name)
@@ -354,6 +373,19 @@ int check_internal_data_status(BlockDriverState *bs,
     return 1;
 }
 
+char *qcas_strdup(const char *str)
+{
+    int len = strlen(str);
+    char *new_buf;
+
+    new_buf = qemu_vmalloc(len + 1);
+    memcpy(new_buf, str, len);
+    
+    new_buf[len] = '\0';
+    
+    return new_buf;
+}
+
 #define IS_ARRAY_FILLED_BY_VAL(entry, n, value) \
     do {                                        \
         int i;                                  \
@@ -364,14 +396,14 @@ int check_internal_data_status(BlockDriverState *bs,
         return 1;                               \
     } while (0);
 
+int __is_nullhash(const QCasFingerprintBlock *hash_value)
+{    
+    IS_ARRAY_FILLED_BY_VAL(hash_value->sha1_hash[i], 20, 0x0);
+}
+
 static int is_nullhash(const QCasRecipeSector2Fingprt *l1_entry)
 {    
     IS_ARRAY_FILLED_BY_VAL(l1_entry->fingerprint.sha1_hash[i], 20, 0x0);
-}
-
-static int __is_nullhash(const QCasFingerprintBlock *hash_value)
-{    
-    IS_ARRAY_FILLED_BY_VAL(hash_value->sha1_hash[i], 20, 0x0);
 }
 
 static int is_hash_calclated(const QCasRecipeSector2Fingprt *l1_entry)
@@ -425,8 +457,8 @@ static uint64_t allocate_datablock_offset(BlockDriverState *bs)
     return allocated_offset;
 }
 
-static void dump_refcount_status(QCasDatablkFingprtOffset *datablk,
-                                 int increment)
+void dump_refcount_status(QCasDatablkFingprtOffset *datablk,
+                          int increment)
 {
     char hash[41];
 
@@ -443,7 +475,9 @@ static void inc_refcount(BlockDriverState *bs,
                          QCasDatablkFingprtOffset *l2_entry)
 {
   //    assert(datablk->ref_count >= 0);
+#ifdef DEBUG
     dump_refcount_status(l2_entry, 1);
+#endif
     l2_entry->ref_count++;
 }
 
@@ -453,26 +487,33 @@ static void dec_refcount_and_do_gc(BlockDriverState *bs,
 {
     BDRVQcasState *s = bs->opaque;
     void *ret;
-    
-//    dump_refcount_status(l2_entry, 0);
-    l2_entry->ref_count--;
 
-    //assert(l2_entry->ref_count >= 0);
+    /*
+     *  be atomic!!!
+     */
+    
+#ifdef DEBUG
+    dump_refcount_status(l2_entry, 0);
+#endif
+    
+    l2_entry->ref_count--;
     
     if (l2_entry->ref_count <= 0) {
-        //
-        //  be atomic!!!
-        //
-
         /* remove from L2 table */        
         ret = ght_remove(s->hash_table, sizeof(QCasFingerprintBlock), &l2_entry->fingerprint);
-        assert(ret != NULL);
+        if (ret == NULL) {
+            char ascii_hash[41] = {0};
 
-        if (gc_with_datablk) {
-            QCasFreeBlockoffset *freeblk_entry = qemu_vmalloc(sizeof(QCasFreeBlockoffset));
-            freeblk_entry->offset = l2_entry->offset;
-            QLIST_INSERT_HEAD(&s->freeblock_list, freeblk_entry, next_in_flight);
-            memset(l2_entry, 0, sizeof(QCasDatablkFingprtOffset));
+            hash2fname(&l2_entry->fingerprint, ascii_hash);
+            fprintf(stderr, "Oops, Could not remove %s from L2 table\n", ascii_hash);
+        } else {
+            if (gc_with_datablk) {
+                QCasFreeBlockoffset *freeblk_entry = qemu_vmalloc(sizeof(QCasFreeBlockoffset));
+                freeblk_entry->offset = l2_entry->offset;
+                QLIST_INSERT_HEAD(&s->freeblock_list, freeblk_entry, next_in_flight);
+                memset(l2_entry, 0, sizeof(QCasDatablkFingprtOffset));
+            }
+            qemu_vfree(l2_entry);
         }
     }
     
@@ -598,6 +639,76 @@ fail:
     return ret;
 }
 
+static int qcas_read_snapshots(BlockDriverState *bs)
+{
+    BDRVQcasState *s = bs->opaque;
+    QCasSnapshotHeader h;
+    QCasSnapshot *sn;
+    int64_t offset;
+    int i, id_str_size, name_size;
+    int ret;
+
+    if (s->nb_snapshots <= 0) {
+        s->snapshots = NULL;
+        return 0;
+    }
+
+    assert(s->snapshots_offset > 0);
+    offset = s->snapshots_offset;
+    
+    s->snapshots = qemu_vmalloc(s->nb_snapshots * sizeof(QCasSnapshot));
+    assert(s->snapshots != NULL);
+
+    for(i = 0; i < s->nb_snapshots; i++) {
+        ret = bdrv_pread(s->recipe_bs, offset, &h, sizeof(h));
+        if (ret < 0) {
+            goto fail;
+        }
+
+        sn = &s->snapshots[i];
+        
+        sn->l1_table_offset = be64_to_cpu(h.l1_table_offset);
+        sn->l1_size         = be32_to_cpu(h.l1_size);
+        sn->vm_state_size   = be64_to_cpu(h.vm_state_size);
+        sn->vm_clock_nsec   = be64_to_cpu(h.vm_clock_nsec);
+        sn->date_sec        = be32_to_cpu(h.date_sec);
+        sn->date_nsec       = be32_to_cpu(h.date_nsec);
+
+        id_str_size = be16_to_cpu(h.id_str_size);
+        name_size   = be16_to_cpu(h.name_size);
+        
+        offset += sizeof(h);
+        
+        /* Read snapshot ID */
+        sn->id_str = qemu_vmalloc(id_str_size + 1);
+        assert(sn->id_str != NULL);
+        
+        ret = bdrv_pread(s->recipe_bs, offset, sn->id_str, id_str_size);
+        if (ret < 0) {
+            goto fail;
+        }
+
+        sn->id_str[id_str_size] = '\0';
+        offset += id_str_size;
+
+        /* Read snapshot name */
+        sn->name = qemu_vmalloc(name_size + 1);
+        assert(sn->name != NULL);
+
+        ret = bdrv_pread(s->recipe_bs, offset, sn->name, name_size);
+        if (ret < 0) {
+            goto fail;
+        }
+        sn->name[name_size] = '\0';
+        offset += name_size;
+    }
+    
+    return 0;
+
+fail:
+    return ret;    
+}
+
 static int qcas_open_dbfile(BlockDriverState *bs)
 {
     BDRVQcasState *s = bs->opaque;
@@ -703,6 +814,8 @@ static int qcas_open(BlockDriverState *bs, int flags)
     be64_to_cpus((uint64_t*)&header.blocksize);
     be32_to_cpus(&header.sec_fingprt_index_crc32);
     be32_to_cpus(&header.sec_fingprt_index_count);
+    be64_to_cpus(&header.snapshots_offset);
+    be32_to_cpus(&header.nb_snapshots);
     
     DPRINTF("header.sec_fingprt_index_count: %d\n", 
             header.sec_fingprt_index_count);
@@ -750,6 +863,12 @@ static int qcas_open(BlockDriverState *bs, int flags)
         goto fail;
     }   
 
+    /* read snapshots */
+    s->snapshots_offset = header.snapshots_offset;
+    s->nb_snapshots     = header.nb_snapshots;
+    s->snapshots        = NULL;    
+    qcas_read_snapshots(bs);
+
     /* end of reading recipe file */
 
     /* Secondly, reading datablock file */
@@ -780,6 +899,7 @@ static int qcas_open(BlockDriverState *bs, int flags)
     assert(s->sec2fingprt_tbl != NULL);
     assert(s->sec2fingprt_tbl_idxcount != 0);
     assert(s->sec2fingprt_tbl_length != 0);
+    assert(s->snapshots_offset > 0);
     assert(s->hash_table != NULL);
     
     return 0;
@@ -802,7 +922,7 @@ static void qcas_close(BlockDriverState *bs)
     QCasFingprtOffsetTblHeader fpotbl_header;
 //    uint32_t old_fingprt_offset_index_count;
 //    uint64_t required_punch_hole_size;
-    int i;
+    uint32_t i;
 #ifdef DEBUG
     int ret;
 #endif
@@ -830,7 +950,9 @@ static void qcas_close(BlockDriverState *bs)
     tbl_size = s->sec2fingprt_tbl_length;
     new_crc32_value = qcas_crc32_le((uint8_t*)s->sec2fingprt_tbl, s->sec2fingprt_tbl_length);
     recipe_header.sec_fingprt_index_crc32 = cpu_to_be32(new_crc32_value);
-    //assert(be32_to_cpus(&recipe_header.sec_fingprt_index_count) == s->sec2fingprt_tbl_idxcount);
+    
+    recipe_header.nb_snapshots     = cpu_to_be32(s->nb_snapshots);
+    recipe_header.snapshots_offset = cpu_to_be64(s->snapshots_offset);
     
     /* restore header for recipe file */
 #ifdef DEBUG
@@ -839,6 +961,21 @@ static void qcas_close(BlockDriverState *bs)
 #else
     bdrv_pwrite(s->recipe_bs, 0, &recipe_header, sizeof(recipe_header));
 #endif
+
+    /* release snapshots on memory */
+    QCasSnapshot *sn;
+    
+    for (i = 0 ; i < s->nb_snapshots ; i++) {
+        sn = &(s->snapshots[i]);
+        qemu_vfree(sn->id_str);
+        qemu_vfree(sn->name);
+    }
+
+    if (s->nb_snapshots > 0) {
+        qemu_vfree(s->snapshots);
+    }
+
+    /* end of release snapshots on memory */
     
     /* restore the table of fingerprint into disk */
 #ifdef DEBUG
@@ -869,11 +1006,7 @@ static void qcas_close(BlockDriverState *bs)
                s->fingprt2offset_tbl_idxcount);
     }
 #endif
-
-//    
-//  assert(ght_size(s->hash_table) == s->fingprt2offset_tbl_idxcount);
-//  ght_sizeはどうも要素数を表しているわけではないらしい  
-// 
+    
     tbl_size = s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset);
     fingprtoffset_buf = qemu_blockalign(bs, tbl_size);
     assert(fingprtoffset_buf != NULL);
@@ -885,9 +1018,7 @@ static void qcas_close(BlockDriverState *bs)
         fingprtoffset_buf[i].offset      = p_e->offset;
         fingprtoffset_buf[i].ref_count   = p_e->ref_count;
         qemu_vfree(p_e);
-    }
-    
-//    assert(i == s->fingprt2offset_tbl_idxcount);
+    }   
     
     ght_finalize(s->hash_table);
     
@@ -904,56 +1035,7 @@ static void qcas_close(BlockDriverState *bs)
     assert(ret == sizeof(db_header));
 #else
     bdrv_pread(s->db_bs, 0, &db_header, sizeof(db_header));
-#endif
-        
-/*     old_fingprt_offset_index_count = db_header.fingprt_offset_index_count; */
-/*     be32_to_cpus(&old_fingprt_offset_index_count); */
-    
-/*     required_punch_hole_size =  */
-/*       (s->fingprt2offset_tbl_idxcount * sizeof(QCasDatablkFingprtOffset)) - */
-/*       (old_fingprt_offset_index_count * sizeof(QCasDatablkFingprtOffset)); */
-    
-/*     if (required_punch_hole_size > 0) { */
-/*         uint64_t new_size = required_punch_hole_size + bdrv_getlength(s->db_bs); */
-/*         uint8_t *cluster_block = qemu_blockalign(bs, QCAS_BLOCK_SIZE); */
-/*         assert(cluster_block != NULL); */
-        
-/*         bdrv_truncate(s->db_bs, new_size); */
-/* #ifdef DEBUG_VERBOSE */
-/*         DPRINTF("required_punch_hole_size: %lld\n", required_punch_hole_size); */
-/*         DPRINTF("maxoffset: %lld -- new_size: %lld\n", s->datablock_maxoffset, new_size); */
-/* #endif         */
-/*         /\* NEED to shift data blocks to allocate fingprt2offset table *\/ */
-/*         for (i = (s->fingprt2offset_tbl_idxcount - 1) ; i >= 0 ; i--) {     */
-/*             uint64_t old_db_goffset; */
-/*             uint64_t new_db_goffset; */
-            
-/*             memset(cluster_block, 0, QCAS_BLOCK_SIZE); */
-
-/*             old_db_goffset = s->qcas_datablk_offset + fingprtoffset_buf[i].offset; */
-/*             new_db_goffset = s->qcas_datablk_offset + required_punch_hole_size + fingprtoffset_buf[i].offset; */
-            
-/*             /\* shift data blocks *\/ */
-/* #ifdef DEBUG */
-/*             ret = bdrv_pread(s->db_bs, old_db_goffset, */
-/*                              cluster_block, QCAS_BLOCK_SIZE); */
-/*             assert(ret == QCAS_BLOCK_SIZE); */
-            
-/*             ret = bdrv_pwrite(s->db_bs,  */
-/*                               new_db_goffset, */
-/*                               cluster_block, QCAS_BLOCK_SIZE); */
-/*             assert(ret == QCAS_BLOCK_SIZE); */
-/* #else */
-/*             bdrv_pread(s->db_bs, old_db_goffset,  */
-/*                        cluster_block, QCAS_BLOCK_SIZE); */
-/*             bdrv_pwrite(s->db_bs,  */
-/*                         new_db_goffset, */
-/*                         cluster_block, QCAS_BLOCK_SIZE); */
-/* #endif */
-/*         } */
-
-/*         qemu_vfree(cluster_block); */
-/*     } */
+#endif       
 
     DPRINTF("**** (%s) crc32 for table buf_size: %d ****\n", 
             __FUNCTION__, tbl_size);
@@ -1203,6 +1285,8 @@ static int qcas_create(const char *filename, QEMUOptionParameter *options)
     header.blocksize               = (qcas_byte_t)cpu_to_be64(QCAS_BLOCK_SIZE);
     header.sec_fingprt_index_crc32 = cpu_to_be32(sec2fingprt_tbl_crc);
     header.sec_fingprt_index_count = cpu_to_be32(sec_fingprt_index_count);
+    header.snapshots_offset        = cpu_to_be64(sizeof(header) + sec2fingprt_tbl_size);
+    header.nb_snapshots            = cpu_to_be32(0);
     
     ret = bdrv_pwrite(recipe_bs, 0, &header, header_size);
     if (ret < 0) {
@@ -1977,14 +2061,183 @@ static int qcas_truncate(BlockDriverState *bs, int64_t offset)
     return 0;
 }
 
+static void find_new_snapshot_id(BlockDriverState *bs,
+                                 char *id_str, int id_str_size)
+{
+    BDRVQcasState *s = bs->opaque;
+    QCasSnapshot *sn;
+    int i, id, id_max = 0;
+
+    /* maixmum number that has been generated is new snapshot id */
+    for(i = 0; i < s->nb_snapshots; i++) {
+        sn = &s->snapshots[i];
+        id = strtoul(sn->id_str, NULL, 10);
+        if (id > id_max)
+            id_max = id;
+    }
+    snprintf(id_str, id_str_size, "%d", id_max + 1);
+}
+
+static int find_snapshot_by_id(BlockDriverState *bs, const char *id_str)
+{
+    BDRVQcasState *s = bs->opaque;
+    int i;
+
+    for(i = 0; i < s->nb_snapshots; i++) {
+        if (!strcmp(s->snapshots[i].id_str, id_str))
+            return i;
+    }
+    return -1;
+}
+
+static int qcas_write_snapshots(BlockDriverState *bs)
+{   
+    BDRVQcasState *s = bs->opaque;
+    QCasSnapshotHeader h;
+    QCasSnapshot *sn;
+    uint64_t snapshot_offset, offset;
+    uint64_t l1_table_offset;
+    uint16_t id_str_size, name_size;
+    int i;
+    int ret;
+    
+    snapshot_offset = sizeof(QCasRecipeHeader) + s->sec2fingprt_tbl_length;
+    offset = snapshot_offset;
+
+    assert(s->snapshots_offset == snapshot_offset);
+
+    for (i = 0 ; i < s->nb_snapshots ; i++) {
+        sn = &(s->snapshots[i]);
+
+        id_str_size = strlen(sn->id_str);
+        name_size   = strlen(sn->name);
+
+        l1_table_offset = snapshot_offset 
+            + sizeof(QCasSnapshotHeader) + id_str_size + name_size;
+
+        memset(&h, 0, sizeof(h));
+
+        h.l1_table_offset = cpu_to_be64(l1_table_offset);
+        h.l1_size     = cpu_to_be32(s->sec2fingprt_tbl_length);
+        h.id_str_size = cpu_to_be16(id_str_size);
+        h.name_size   = cpu_to_be16(name_size);
+        h.date_sec    = cpu_to_be32(sn->date_sec);
+        h.date_nsec   = cpu_to_be32(sn->date_nsec);
+        h.vm_clock_nsec = cpu_to_be64(sn->vm_clock_nsec);
+        h.vm_state_size = cpu_to_be32(sn->vm_state_size);
+
+        ret = bdrv_pwrite(s->recipe_bs, offset, &h, sizeof(h));
+        if (ret < 0) {
+            goto fail;
+        }
+        offset += sizeof(h);
+
+        ret = bdrv_pwrite(s->recipe_bs, offset, sn->id_str, id_str_size);
+        if (ret < 0) {
+            goto fail;
+        }
+        offset += id_str_size;
+    
+        ret = bdrv_pwrite(s->recipe_bs, offset, sn->name, name_size);
+        if (ret < 0) {
+            goto fail;
+        }
+        offset += name_size;
+
+        ret = bdrv_pwrite(s->recipe_bs, offset, s->sec2fingprt_tbl, s->sec2fingprt_tbl_length);
+        if (ret < 0) {
+            goto fail;
+        }
+
+        offset += s->sec2fingprt_tbl_length;
+        snapshot_offset += offset;
+    }
+    
+    /* update the recipe file */
+    ret = bdrv_flush(s->recipe_bs);
+    if (ret < 0) {
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    return ret;
+}
+
 /* if no id is provided, a new one is constructed */
 static int qcas_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
 {
+    BDRVQcasState *s = bs->opaque;
+    QCasSnapshot sn1, *sn = &sn1;
+    QCasSnapshot *new_snapshot_list = NULL;
+    QCasSnapshot *old_snapshot_list = NULL;
+    uint64_t i, count;
+    int ret;
+    
     /* Generate an ID if it wasn't passed */
-    /* if (sn_info->id_str[0] == '\0') { */
-    /*     find_new_snapshot_id(bs, sn_info->id_str, sizeof(sn_info->id_str)); */
-    /* } */
+    if (sn_info->id_str[0] == '\0') {
+        find_new_snapshot_id(bs, sn_info->id_str, sizeof(sn_info->id_str));
+    }
+
+    /* Check that the ID is unique */
+    if (find_snapshot_by_id(bs, sn_info->id_str) >= 0) {
+        return -ENOENT;
+    }
+    
+    sn->id_str = qcas_strdup(sn_info->id_str);
+    sn->name   = qcas_strdup(sn_info->name);
+    sn->vm_state_size = sn_info->vm_state_size;
+    sn->vm_clock_nsec = sn_info->vm_clock_nsec;
+    sn->date_sec      = sn_info->date_sec;
+    sn->date_nsec     = sn_info->date_nsec;
+
+    /* update refcount of entries in l2 table  */
+    count = s->sec2fingprt_tbl_idxcount;
+    
+    for (i = 0 ; i < count ; i++) {
+        
+        QCasRecipeSector2Fingprt *l1_entry = &s->sec2fingprt_tbl[i];
+        QCasDatablkFingprtOffset *l2_entry;
+
+        if (is_nullhash(l1_entry)) continue;
+
+        if ((l2_entry = ght_get(s->hash_table, sizeof(QCasFingerprintBlock),
+                                &l1_entry->fingerprint))) {
+            inc_refcount(bs, l2_entry);
+        } else {
+            fprintf(stderr, 
+                    "Could not find l2_entry for a fingerprint in l1_table\n"
+                    "This image may be broken\n");
+            goto fail;
+        }
+    }
+
+    /* Append the new snapshot to the snapshot list */
+    new_snapshot_list = qemu_vmalloc((s->nb_snapshots + 1) * sizeof(QCasSnapshot));
+    if (s->snapshots) {
+        memcpy(new_snapshot_list, s->snapshots,
+               s->nb_snapshots * sizeof(QCasSnapshot));
+        old_snapshot_list = s->snapshots;
+    }
+    s->snapshots = new_snapshot_list;
+    s->snapshots[s->nb_snapshots++] = *sn; /* append the new snapshot at tail */
+
+    ret = qcas_write_snapshots(bs);
+    if (ret < 0) {
+        fprintf(stderr, "Could not write snapshot\n");
+        qemu_vfree(s->snapshots);
+        s->snapshots = old_snapshot_list;
+        goto fail;
+    }
+
     return 0;
+
+fail:
+    qemu_vfree(sn->id_str);
+    qemu_vfree(sn->name);
+    
+    return ret;
 }
 
 /* copy the snapshot 'snapshot_name' into the current disk image */
@@ -2000,7 +2253,35 @@ static int qcas_snapshot_delete(BlockDriverState *bs, const char *snapshot_id)
 
 static int qcas_snapshot_list(BlockDriverState *bs, QEMUSnapshotInfo **psn_tab)
 {
-    return 0;
+    BDRVQcasState *s = bs->opaque;
+    QEMUSnapshotInfo *sn_tab, *sn_info;
+    QCasSnapshot *sn;
+    int i;
+
+    if (!s->nb_snapshots) {
+        *psn_tab = NULL;
+        return s->nb_snapshots;
+    }
+
+    sn_tab = g_malloc0(s->nb_snapshots * sizeof(QEMUSnapshotInfo));
+    for (i = 0 ; i < s->nb_snapshots ; i++) {
+        sn_info = &sn_tab[i];
+        sn      = &s->snapshots[i];
+        
+        pstrcpy(sn_info->id_str, sizeof(sn_info->id_str),
+                sn->id_str);
+        pstrcpy(sn_info->name, sizeof(sn_info->name),
+                sn->name);
+        
+        sn_info->vm_state_size  = sn->vm_state_size;
+        sn_info->date_sec       = sn->date_sec;
+        sn_info->date_nsec      = sn->date_nsec;
+        sn_info->vm_clock_nsec  = sn->vm_clock_nsec;
+    }
+
+    *psn_tab = sn_tab;
+    
+    return s->nb_snapshots;
 }
 
 static int qcas_snapshot_load_tmp(BlockDriverState *bs, const char *snapshot_name)

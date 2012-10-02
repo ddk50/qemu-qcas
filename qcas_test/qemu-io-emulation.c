@@ -4,721 +4,21 @@
 #include "qemu-bswap-emulation.h"
 #include "sha1.h"
 
-#include <ght_hash_table.h>
-#include <sys/mount.h>
-
-#include "../block/qcas-debug.h"
-#include "../block/qcas.c"
-
-static BlockDriver *bdrv_handlers = &bdrv_qcas;
-
-/* test */
-void print_sha1_of_data(uint8_t *buf, int buf_size, const char *label);
-void hex_dump(const uint8_t *buf, int buf_size, int row_num, const char *label);
-
-void qemu_emulation_layer_test(void);
-void qcas_rw_test_pattern_1(BlockDriverState *bs);
-void qcas_rw_test_pattern_2_after_pattern_1(BlockDriverState *bs);
-void qcas_rw_test_pattern_3_after_pattern_2(BlockDriverState *bs);
-void qcas_rw_test_pattern_4_after_pattern_3(BlockDriverState *bs);
-
-void qcas_boundary_sensitive_rw_test_1(BlockDriverState *bs);
-void qcas_boundary_sensitive_rw_test_2(BlockDriverState *bs);
-void qcas_boundary_sensitive_rw_test_3(BlockDriverState *bs);
-void qcas_boundary_sensitive_rw_test_4(BlockDriverState *bs);
-
-void qcas_sequential_rw_test(BlockDriverState *bs, 
-                             uint32_t window_size,
-                             int random_data);
-
-void qcas_dump_L1_and_L2(BlockDriverState *bs, 
-                         uint64_t start_sector, int nb_sectors);
-
-void filled_buf_by_randomval(uint8_t *buf, size_t size);
-
-int main(void)
+void pstrcpy(char *buf, int buf_size, const char *str)
 {
-    int ret;    
-    BlockDriverState *bs;
-    QEMUOptionParameter *options;
+    int c;
+    char *q = buf;
 
-    srand((unsigned)time(NULL));
+    if (buf_size <= 0)
+        return;
 
-    options = qcas_create_options;
-    
-#define TEST_FILENAME       "test.qcas"
-#define TEST_FILESIZE_BYTE  (20 * 1024 * 1024)
-#define TEST_FILESIZE_SECTOR  (TEST_FILESIZE_BYTE / 512)
-
-#define WINDOW_SIZE_BYTE    (4 * 1024)
-#define WINDOW_SIZE_SECTOR  (WINDOW_SIZE_BYTE / 512)
-
-    /* Write in options */
-    while (options && options->name) {
-        if (!strcmp(options->name, BLOCK_OPT_SIZE)) {
-            /* size = options->value.n; /\* size is in bytes *\/ */
-            options->value.n = TEST_FILESIZE_BYTE;
-        }
-        options++;
+    for(;;) {
+        c = *str++;
+        if (c == 0 || q >= buf + buf_size - 1)
+            break;
+        *q++ = c;
     }
-    
-    ret = bdrv_handlers->bdrv_create(TEST_FILENAME, qcas_create_options);
-    ASSERT(ret >= 0);
-    
-    printf("create complete\n");
-    
-    if ((ret = bdrv_file_open(&bs, TEST_FILENAME, BDRV_O_RDWR)) < 0) {
-        fprintf(stderr, "bdrv_file_open error\n");
-        exit(1);
-    }
-
-    bs->opaque = qemu_vmalloc(bdrv_qcas.instance_size);
-    assert(bs->opaque != NULL);
-    memset(bs->opaque, 0, bdrv_qcas.instance_size);
-
-    ret = bdrv_handlers->bdrv_open(bs, BDRV_O_RDWR);
-    ASSERT(ret >= 0);
-
-    /* qcas_boundary_sensitive_rw_test_1(bs); */
-    /* qcas_boundary_sensitive_rw_test_2(bs); */
-    /* qcas_boundary_sensitive_rw_test_3(bs); */
-
-    /* test pattern */
-    /* qcas_rw_test_pattern_1(bs); */
-    /* qcas_rw_test_pattern_2_after_pattern_1(bs); */
-    /* qcas_rw_test_pattern_3_after_pattern_2(bs); */
-    /* qcas_rw_test_pattern_4_after_pattern_3(bs); */
-    
-    /* qcas_sequential_rw_test(bs, WINDOW_SIZE_BYTE, 0); */
-    qcas_sequential_rw_test(bs, WINDOW_SIZE_BYTE, 1);
-
-    qcas_boundary_sensitive_rw_test_4(bs);
-
-    qemu_vfree(bs->opaque);
-    bdrv_close(bs);
-    
-    return 1;
-}
-
-void qcas_thelper_prepare_rw_test(int c, uint8_t **input_buf, 
-                                  uint8_t **output_buf, 
-                                  QEMUIOVector **input_qiov, 
-                                  QEMUIOVector **output_qiov)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;
-    QEMUIOVector *t_input_qiov;
-    QEMUIOVector *t_output_qiov;
-
-    input_buffer  = qemu_vmalloc(WINDOW_SIZE_BYTE);
-    output_buffer = qemu_vmalloc(WINDOW_SIZE_BYTE);    
-    ASSERT(input_buffer != NULL);
-    ASSERT(output_buffer != NULL);
-
-    memset(output_buffer, 0, WINDOW_SIZE_BYTE);
-
-    memset(input_buffer, c, WINDOW_SIZE_BYTE);
-    t_input_qiov = qemu_create_iovec();
-    qemu_iovec_from_buffer(t_input_qiov, input_buffer, WINDOW_SIZE_BYTE);
-   
-    t_output_qiov = qemu_create_iovec();
-
-    *input_buf  = input_buffer;
-    *output_buf = output_buffer;
-    
-    *input_qiov   = t_input_qiov;
-    *output_qiov  = t_output_qiov;   
-}
-
-void qcas_thelper_release_rw_test(uint8_t *input_buf, 
-                                  uint8_t *output_buf, 
-                                  QEMUIOVector *input_qiov,
-                                  QEMUIOVector *output_qiov)
-{
-    qemu_vfree(input_buf);
-    qemu_vfree(output_buf);
-    qemu_destroy_iovec(input_qiov);
-    qemu_destroy_iovec(output_qiov);
-}
-
-
-/* #define QCAS_BOUNDARY_SENSITIVE_RW_TEST(sensitive_sector, test_number)  */
-/* void qcas_boundary_sensitive_rw_test_ ## test_number ## (BlockDriverState *bs) */
-/* { */
-/*     uint64_t start_sector = (sensitive_sector); */
-/*     uint8_t *input_buffer;     */
-/*     uint8_t *output_buffer; */
-/*     QEMUIOVector *qiov; */
-/*     int ret; */
-    
-/*     qcas_debug_clear_log();  */
-/*     { */
-/*         qcas_thelper_prepare_rw_test('a', &input_buffer, &output_buffer, &qiov); */
-/*         { */
-/*             ret = bdrv_handlers->bdrv_co_writev(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, qiov); */
-/*             ASSERT(ret == 0); */
-/*             qcas_debug_dump_event_log(); */
-
-/*             ret = bdrv_handlers->bdrv_co_readv(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, qiov); */
-/*             ASSERT(ret == 0); */
-/*             qcas_debug_dump_event_log(); */
-
-/*             qemu_iovec_to_buffer(qiov, output_buffer); */
-
-/*             if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) { */
-/*                 TEST_MSG_OK("qcas sensitive boundary rw test %s", #test_number); */
-/*             } else { */
-/*                 TEST_MSG_FAILED("qcas sensitive boundary rw test %s", #test_number); */
-/*             } */
-
-/*             qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR); */
-            
-/*         } qcas_thelper_release_rw_test(input_buffer, output_buffer, qiov); */
-        
-/*         qcas_thelper_prepare_rw_test('k', &input_buffer, &output_buffer, &qiov); */
-/*         { */
-/*             ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, qiov);     */
-/*             ASSERT(ret == 0); */
-/*             qcas_debug_dump_event_log(); */
-            
-/*             ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, qiov); */
-/*             ASSERT(ret == 0); */
-/*             qcas_debug_dump_event_log(); */
-            
-/*             qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR); */
-            
-/*             qemu_iovec_to_buffer(qiov, output_buffer); */
-
-/*             if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) { */
-/*                 TEST_MSG_OK("qcas sensitive boundary rw test %s", #test_number); */
-/*             } else { */
-/*                 TEST_MSG_FAILED("qcas sensitive boundary rw test %s", #test_number); */
-/*             } */
-/*         } qcas_thelper_release_rw_test(input_buffer, output_buffer, qiov); */
-/*     } qcas_debug_clear_log();     */
-/* } */
-
-void qcas_boundary_sensitive_rw_test_1(BlockDriverState *bs)
-{
-#define SENSITIVE_BOUNDARY_SECTOR 0x7f9
-    uint64_t start_sector = SENSITIVE_BOUNDARY_SECTOR;
-    uint8_t *input_buffer;    
-    uint8_t *output_buffer;
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    int ret;
-    
-    qcas_debug_clear_log(); 
-    {
-        qcas_thelper_prepare_rw_test('a', &input_buffer, &output_buffer, &input_qiov, &output_qiov);
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            printf("*** writev ***:\n");
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 1");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 1");
-            }
-
-            printf("*** readv ***:\n");
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-
-
-            printf("*** writev ***:\n");
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-            printf("*** readv ***:\n");
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);            
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 2");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 2");
-            }
-
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-    } qcas_debug_clear_log();
-
-}
-
-void qcas_boundary_sensitive_rw_test_2(BlockDriverState *bs)
-{
-#define SENSITIVE_BOUNDARY_SECTOR 0x7f9
-    uint64_t start_sector = SENSITIVE_BOUNDARY_SECTOR;
-    uint8_t *input_buffer;    
-    uint8_t *output_buffer;
-    QEMUIOVector *output_qiov;
-    QEMUIOVector *input_qiov;
-    int ret;
-    
-    qcas_debug_clear_log(); 
-    {
-        qcas_thelper_prepare_rw_test('a', &input_buffer, &output_buffer, &input_qiov, &output_qiov);
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 2");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 2");
-            }
-
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-        
-        qcas_thelper_prepare_rw_test('k', &input_buffer, &output_buffer, &input_qiov, &output_qiov);
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-            
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 2");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 2");
-            }
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-    } qcas_debug_clear_log();
-
-}
-
-void qcas_boundary_sensitive_rw_test_3(BlockDriverState *bs)
-{
-    uint64_t start_sector = 0x9ff7;
-    uint8_t *input_buffer;    
-    uint8_t *output_buffer;
-    QEMUIOVector *output_qiov;
-    QEMUIOVector *input_qiov;
-    int ret;
-    
-    qcas_debug_clear_log(); 
-    {
-
-        qcas_thelper_prepare_rw_test('a', &input_buffer, &output_buffer, 
-                                     &input_qiov, &output_qiov);
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector - WINDOW_SIZE_SECTOR, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 3");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 3");
-            }
-
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-        
-        qcas_thelper_prepare_rw_test('k', &input_buffer, &output_buffer, 
-                                     &input_qiov, &output_qiov);
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);    
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_debug_dump_event_log();
-            
-            qcas_dump_L1_and_L2(bs, 0, start_sector + WINDOW_SIZE_SECTOR);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas sensitive boundary rw test 3");
-            } else {
-                TEST_MSG_FAILED("qcas sensitive boundary rw test 3");
-            }
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, 
-                                       input_qiov, output_qiov);
-    } qcas_debug_clear_log();    
-}
-
-void qcas_boundary_sensitive_rw_test_4(BlockDriverState *bs)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    int ret;
-
-    qcas_debug_enable_tracing();
-    
-    qcas_thelper_prepare_rw_test(0xff, &input_buffer, &output_buffer, 
-                                 &input_qiov, &output_qiov);
-    {
-        memset(output_buffer, 0, WINDOW_SIZE_BYTE);
-        qcas_debug_clear_log();
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, 0x7f7, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, 0x7f7, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-        }; qcas_debug_dump_event_log();
-
-        if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-            TEST_MSG_OK("qcas sensitive boundary rw test 1 of 4 ");
-        } else {
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            TEST_MSG_FAILED("qcas sensitive boundary rw test 1 of 4");
-        } 
-
-    }; qcas_thelper_release_rw_test(input_buffer, output_buffer, 
-                                   input_qiov, output_qiov);
-
-    qcas_thelper_prepare_rw_test(0xa, &input_buffer, &output_buffer, 
-                                 &input_qiov, &output_qiov);
-    {
-        memset(output_buffer, 0, WINDOW_SIZE_BYTE);
-        qcas_debug_clear_log();
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, 0x7f8, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, 0x7f8, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-        }; qcas_debug_dump_event_log();
-
-        if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-            TEST_MSG_OK("qcas sensitive boundary rw test 2 of 4 ");
-        } else {
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            TEST_MSG_FAILED("qcas sensitive boundary rw test 2 of 4");
-        }
-        
-    }; qcas_thelper_release_rw_test(input_buffer, output_buffer, 
-                                    input_qiov, output_qiov);
-    
-        
-    qcas_thelper_prepare_rw_test(0xa, &input_buffer, &output_buffer, 
-                                 &input_qiov, &output_qiov);
-    {
-        memset(output_buffer, 0, WINDOW_SIZE_BYTE);
-        qcas_debug_clear_log();
-        {
-            ret = bdrv_handlers->bdrv_co_writev(bs, 0x7f9, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, 0x7f9, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-            
-        }; qcas_debug_dump_event_log();
-
-        if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-            TEST_MSG_OK("qcas sensitive boundary rw test 3 of 4");
-        } else {
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-//            hex_dump(input_buffer, WINDOW_SIZE_BYTE, 70, "input_buffer");
-//            hex_dump(output_buffer, WINDOW_SIZE_BYTE, 70, "output_buffer");
-            print_sha1_of_data(input_buffer, WINDOW_SIZE_BYTE, "**** input_buffer **** :");
-            print_sha1_of_data(output_buffer, WINDOW_SIZE_BYTE, "**** output_buffer **** :");
-            TEST_MSG_FAILED("qcas sensitive boundary rw test 3 of 4");
-        }
-    }; qcas_thelper_release_rw_test(input_buffer, output_buffer, 
-                                    input_qiov, output_qiov);
-}
-
-void qcas_sequential_rw_test(BlockDriverState *bs, 
-                             uint32_t window_size,
-                             int random_data)
-{   
-    QEMUIOVector *qiov;
-    uint64_t i;
-    int ret;
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;
-
-    qiov = qemu_create_iovec();
-    ASSERT(qiov != NULL);   
-    input_buffer  = qemu_vmalloc(WINDOW_SIZE_BYTE);
-    output_buffer = qemu_vmalloc(WINDOW_SIZE_BYTE);
-    ASSERT(input_buffer != NULL);
-    ASSERT(output_buffer != NULL);
-
-    qcas_debug_enable_tracing();
-
-    for (i = 0 ; i < (TEST_FILESIZE_SECTOR - WINDOW_SIZE_SECTOR) ; i++) {
-        
-        int data = random_data ? (rand() & 0xff) : 0xff;
-        memset(input_buffer, data, WINDOW_SIZE_BYTE);
-        
-        qemu_iovec_from_buffer(qiov, input_buffer, WINDOW_SIZE_BYTE);
-
-        qcas_debug_clear_log(); {
-            ret = bdrv_handlers->bdrv_co_writev(bs, i, WINDOW_SIZE_SECTOR, qiov);
-            ASSERT(ret == 0);
-
-            ret = bdrv_handlers->bdrv_co_readv(bs, i, WINDOW_SIZE_SECTOR, qiov);
-            ASSERT(ret == 0);   
-            qcas_debug_dump_event_log();
-        };
-
-        qemu_iovec_to_buffer(qiov, output_buffer);
-
-//        print_sha1_of_data(output_buffer, WINDOW_SIZE_SECTOR, "output_buffer");
-//        print_sha1_of_data(input_buffer, WINDOW_SIZE_SECTOR, "input_buffer");
-
-//        qcas_dump_L1_and_L2(bs, 0, i);
-
-        if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-            fprintf(stderr,
-                    "TESTING 0x%016llx ... 0x%016llx (sector) R/W [\x1b[32m OK \x1b[37m]\n",
-                    i, i + WINDOW_SIZE_BYTE);
-        } else {
-            fprintf(stderr,
-                    "TESTING 0x%016llx ... 0x%016llx (sector) R/W [\x1b[31m FAILED \x1b[37m]\n",
-                    i, i + WINDOW_SIZE_BYTE);
-            qcas_dump_L1_and_L2(bs, 0, TEST_FILESIZE_SECTOR);
-            abort();
-        }
-    }
-
-    qemu_vfree(input_buffer);
-    qemu_vfree(output_buffer);
-    
-}
-
-/* 全く何もないところにデータをいきなり'A' filledなデータを書きこむテスト */
-void qcas_rw_test_pattern_1(BlockDriverState *bs)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;    
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    uint64_t start_sector = 0;
-    int ret;
-        
-    const qcas_rw_event_t rw_pattern_1[] = {
-        EVENT_QCAS_ALLOCATE_NEW_DATABLOCK_ALLOC_NEWBLOCK,
-        EVENT_QCAS_CO_READ_DATABLOCK,
-        EVENT_QCAS_TERMINATER,
-    };
-
-    qcas_debug_clear_log();
-    {
-        qcas_thelper_prepare_rw_test('A', &input_buffer, &output_buffer, &input_qiov, &output_qiov);
-        {            
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas buffer rw test (pattern 1)");
-            } else {
-                TEST_MSG_FAILED("qcas buffer rw test (pattern 1)");
-            }
-
-            if (qcas_debug_cmp_event_log(rw_pattern_1)) {
-                TEST_MSG_OK("qcas tracing function test (pattern 1)");
-            } else {
-                TEST_MSG_FAILED("qcas tracing function test (pattern 1)");
-            }
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-    } qcas_debug_clear_log();
-
-    qcas_dump_L1_and_L2(bs, start_sector, WINDOW_SIZE_SECTOR);
-}
-
-/* pattern 1で書きこまれた'A" filledな場所を'B' filledなバッファで書き換えてみる */
-void qcas_rw_test_pattern_2_after_pattern_1(BlockDriverState *bs)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;    
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    uint64_t start_sector = 0;
-    int ret;
-
-    const qcas_rw_event_t rw_pattern_2[] = {
-        EVENT_QCAS_CO_OVERWRITE_DATABLOCK_NO_REFERENCE_BY_OTHER_L1_ENTRIES,
-        EVENT_QCAS_CO_DO_CALCULATE_FINGERPRINT_INSERT_L2_TABLE,
-        EVENT_QCAS_TERMINATER,
-    };
-
-    qcas_debug_clear_log();
-    {
-        qcas_thelper_prepare_rw_test('B', &input_buffer, &output_buffer, 
-                                     &input_qiov, &output_qiov);
-        {            
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas buffer rw test (pattern 2)");
-            } else {
-                TEST_MSG_FAILED("qcas buffer rw test (pattern 2)");
-            }
-
-            if (qcas_debug_cmp_event_log(rw_pattern_2)) {
-                TEST_MSG_OK("qcas tracing function test (pattern 2)");
-            } else {
-                TEST_MSG_FAILED("qcas tracing function test (pattern 2)");
-            }
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, 
-                                       input_qiov, output_qiov);
-    } qcas_debug_clear_log();    
-    
-    qcas_dump_L1_and_L2(bs, start_sector, WINDOW_SIZE_SECTOR);
-}
-
-/* pattern 2で書きこまれた'B" filledな場所を再び'B' filledなバッファで書き換えてみる */
-void qcas_rw_test_pattern_3_after_pattern_2(BlockDriverState *bs)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    uint64_t start_sector = 0;
-    int ret;
-
-    const qcas_rw_event_t rw_pattern_3[] = {
-        EVENT_QCAS_CO_OVERWRITE_DATABLOCK_NO_REFERENCE_BY_OTHER_L1_ENTRIES,
-        EVENT_QCAS_CO_DO_CALCULATE_FINGERPRINT_INSERT_L2_TABLE,
-        EVENT_QCAS_TERMINATER,
-    };
-
-    qcas_debug_clear_log();
-    {
-        qcas_thelper_prepare_rw_test('B', &input_buffer, &output_buffer, 
-                                     &input_qiov, &output_qiov);
-        {            
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas buffer rw test (pattern 3)");
-            } else {
-                TEST_MSG_FAILED("qcas buffer rw test (pattern 3)");
-            }
-
-            if (qcas_debug_cmp_event_log(rw_pattern_3)) {
-                TEST_MSG_OK("qcas tracing function test (pattern 3)");
-            } else {
-                TEST_MSG_FAILED("qcas tracing function test (pattern 3)");
-            }
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-    } qcas_debug_clear_log();    
-
-    qcas_dump_L1_and_L2(bs, start_sector, WINDOW_SIZE_SECTOR);
-}
-
-/* pattern 3で書きこまれた'B" filledな場所とは別の場所に再び'B' filledなバッファを書き込む */
-/* 書き込み先は初めて書きこむ場所である */
-void qcas_rw_test_pattern_4_after_pattern_3(BlockDriverState *bs)
-{
-    uint8_t *input_buffer;
-    uint8_t *output_buffer;
-    QEMUIOVector *input_qiov;
-    QEMUIOVector *output_qiov;
-    uint64_t start_sector = (1 * 1024 * 1024) / 512;
-    int ret;
-
-    const qcas_rw_event_t rw_pattern_4[] = {
-        EVENT_QCAS_ALLOCATE_NEW_DATABLOCK_DEDUP,
-        EVENT_QCAS_CO_READ_DATABLOCK,
-        EVENT_QCAS_TERMINATER,
-    };
-
-    qcas_debug_clear_log();
-    {
-        qcas_thelper_prepare_rw_test('B', &input_buffer, &output_buffer, &input_qiov, &output_qiov);
-        {            
-            ret = bdrv_handlers->bdrv_co_writev(bs, start_sector, WINDOW_SIZE_SECTOR, input_qiov);
-            ASSERT(ret == 0);
-            
-            ret = bdrv_handlers->bdrv_co_readv(bs, start_sector, WINDOW_SIZE_SECTOR, output_qiov);
-            ASSERT(ret == 0);
-            
-            qemu_iovec_to_buffer(output_qiov, output_buffer);
-
-            if (memcmp(output_buffer, input_buffer, WINDOW_SIZE_BYTE) == 0) {
-                TEST_MSG_OK("qcas buffer rw test (pattern 4)");
-            } else {
-                TEST_MSG_FAILED("qcas buffer rw test (pattern 4)");
-            }
-
-            if (qcas_debug_cmp_event_log(rw_pattern_4)) {
-                TEST_MSG_OK("qcas tracing function test (pattern 4)");
-            } else {
-                TEST_MSG_FAILED("qcas tracing function test (pattern 4)");
-            }
-            
-        } qcas_thelper_release_rw_test(input_buffer, output_buffer, input_qiov, output_qiov);
-    } qcas_debug_clear_log();
-
-    qcas_dump_L1_and_L2(bs, start_sector, WINDOW_SIZE_SECTOR);
+    *q = '\0';
 }
 
 QEMUIOVector *qemu_create_iovec(void)
@@ -806,7 +106,8 @@ fail_after_alloc:
 
 void bdrv_close(BlockDriverState *bs)
 {
-    fclose(bs->fp);    
+    
+    fclose(bs->fp);
     qemu_vfree(bs);    
 }
 
@@ -1003,6 +304,55 @@ fail:
     return 1;
 }
 
+int bdrv_flush(BlockDriverState *bs)
+{
+    fflush(bs->fp);
+    return 0;
+}
+
+char *bdrv_snapshot_dump(char *buf, int buf_size, QEMUSnapshotInfo *sn)
+{
+    char buf1[128], date_buf[128], clock_buf[128];
+#ifdef _WIN32
+    struct tm *ptm;
+#else
+    struct tm tm;
+#endif
+    time_t ti;
+    int64_t secs;
+
+    if (!sn) {
+        snprintf(buf, buf_size,
+                 "%-10s%-20s%7s%20s%15s",
+                 "ID", "TAG", "VM SIZE", "DATE", "VM CLOCK");
+    } else {
+        ti = sn->date_sec;
+#ifdef _WIN32
+        ptm = localtime(&ti);
+        strftime(date_buf, sizeof(date_buf),
+                 "%Y-%m-%d %H:%M:%S", ptm);
+#else
+        localtime_r(&ti, &tm);
+        strftime(date_buf, sizeof(date_buf),
+                 "%Y-%m-%d %H:%M:%S", &tm);
+#endif
+        secs = sn->vm_clock_nsec / 1000000000;
+        snprintf(clock_buf, sizeof(clock_buf),
+                 "%02d:%02d:%02d.%03d",
+                 (int)(secs / 3600),
+                 (int)((secs / 60) % 60),
+                 (int)(secs % 60),
+                 (int)((sn->vm_clock_nsec / 1000000) % 1000));
+        snprintf(buf, buf_size,
+                 "%-10s%-20s%7s%20s%15s",
+                 sn->id_str, sn->name,
+                 get_human_readable_size(buf1, sizeof(buf1), sn->vm_state_size),
+                 date_buf,
+                 clock_buf);
+    }
+    return buf;
+}
+
 /**********************************************/
 void *qemu_vmalloc(size_t size)
 {
@@ -1079,4 +429,32 @@ void hex_dump(const uint8_t *buf, int buf_size, int row_num, const char *label)
     fflush(stdout);
 }
 
+#define NB_SUFFIXES 4
 
+char *get_human_readable_size(char *buf, int buf_size, int64_t size)
+{
+    static const char suffixes[NB_SUFFIXES] = "KMGT";
+    int64_t base;
+    int i;
+
+    if (size <= 999) {
+        snprintf(buf, buf_size, "%" PRId64, size);
+    } else {
+        base = 1024;
+        for(i = 0; i < NB_SUFFIXES; i++) {
+            if (size < (10 * base)) {
+                snprintf(buf, buf_size, "%0.1f%c",
+                         (double)size / base,
+                         suffixes[i]);
+                break;
+            } else if (size < (1000 * base) || i == (NB_SUFFIXES - 1)) {
+                snprintf(buf, buf_size, "%" PRId64 "%c",
+                         ((size + (base >> 1)) / base),
+                         suffixes[i]);
+                break;
+            }
+            base = base * 1024;
+        }
+    }
+    return buf;
+}

@@ -19,6 +19,9 @@ typedef enum qcas_rw_event_t {
     EVENT_QCAS_TERMINATER = 0x0,
 } qcas_rw_event_t;
 
+struct BlockDriverState;
+typedef struct BlockDriverState BlockDriverState;
+
 void qcas_debug_enable_tracing(void);
 void qcas_debug_disable_tracing(void);
 void qcas_debug_init_tracing(void);
@@ -27,5 +30,9 @@ void qcas_debug_clear_log(void);
 void qcas_debug_add_event(qcas_rw_event_t type);
 void qcas_debug_dump_event_log(void);
 int qcas_debug_cmp_event_log(const qcas_rw_event_t *pattern);
+
+void qcas_dump_L2(BlockDriverState *bs);
+void qcas_dump_L1_and_L2(BlockDriverState *bs, 
+                         uint64_t sector_num, int nb_sectors);
 
 #endif

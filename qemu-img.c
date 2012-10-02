@@ -1077,7 +1077,6 @@ out:
     return 0;
 }
 
-
 static void dump_snapshots(BlockDriverState *bs)
 {
     QEMUSnapshotInfo *sn_tab, *sn;

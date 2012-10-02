@@ -12,10 +12,15 @@
 #include <errno.h>
 #include <assert.h>
 #include <pthread.h>
+#include <inttypes.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/time.h>
+
+#include <glib.h>
+#include <glib/gprintf.h>
 
 #include "qemu-queue.h"
 
@@ -28,6 +33,13 @@
 # define QEMU_PACKED __attribute__((packed))
 #endif
 
+#if defined(__HAIKU__) && defined(__i386__)
+#define FMT_pid "%ld"
+#elif defined(WIN64)
+#define FMT_pid "%" PRId64
+#else
+#define FMT_pid "%d"
+#endif
 
 /* TODO: qemu_co_mutex_initを実装 */
 
@@ -94,7 +106,14 @@ typedef struct BlockDriverInfo {
 } BlockDriverInfo;
 
 typedef struct QEMUSnapshotInfo {
-    void *padding;
+    char id_str[128]; /* unique snapshot id */
+    /* the following fields are informative. They are not needed for
+       the consistency of the snapshot */
+    char name[256]; /* user chosen name */
+    uint64_t vm_state_size; /* VM state info size */
+    uint32_t date_sec; /* UTC date of the snapshot */
+    uint32_t date_nsec;
+    uint64_t vm_clock_nsec; /* VM clock relative to boot */
 } QEMUSnapshotInfo;
 
 typedef struct BlockDriver {
@@ -162,6 +181,9 @@ int bdrv_pread(BlockDriverState *bs, int64_t offset,
                void *buf, int count1);
 int bdrv_pwrite(BlockDriverState *bs, int64_t offset,
                 const void *buf, int count1);
+int bdrv_flush(BlockDriverState *bs);
+
+char *bdrv_snapshot_dump(char *buf, int buf_size, QEMUSnapshotInfo *sn);
 
 /* mutex */
 
@@ -174,5 +196,18 @@ void qemu_co_mutex_lock(CoMutex *mutex);
 void qemu_co_mutex_unlock(CoMutex *mutex);
 
 void qerror_report(const char *fmt, ...);
+
+/* cutils */
+void pstrcpy(char *buf, int buf_size, const char *str);
+
+/* miscs */
+void print_sha1_of_data(uint8_t *buf, int buf_size, const char *label);
+void hex_dump(const uint8_t *buf, int buf_size, int row_num, const char *label);
+void filled_buf_by_randomval(uint8_t *buf, size_t size);
+char *get_human_readable_size(char *buf, int buf_size, int64_t size);
+
+typedef struct timeval qemu_timeval;
+#define qemu_gettimeofday(tp) \
+    gettimeofday(tp, NULL)
 
 #endif
