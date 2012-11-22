@@ -40,8 +40,8 @@
 
 #define BDRV_SECTOR_BITS       9
 //#define BDRV_SECTORS_PER_CHUNK 4096 // (4096 -> 2MB)
-#define BDRV_SECTORS_PER_CHUNK 2048 // (2048 -> 1MB)
-//#define BDRV_SECTORS_PER_CHUNK 8 // (8 -> 4KB)
+//#define BDRV_SECTORS_PER_CHUNK 2048 // (2048 -> 1MB)
+#define BDRV_SECTORS_PER_CHUNK 8 // (8 -> 4KB)
 
 #define QCAS_BLOCK_SIZE   (BDRV_SECTORS_PER_CHUNK << BDRV_SECTOR_BITS)
 #define QCAS_BLOCK_SECTOR (BDRV_SECTORS_PER_CHUNK)
@@ -532,7 +532,7 @@ static void fix_fingerprint(QCasRecipeSector2Fingprt *l1_entry,
 }
 
 static int restore_fingprt2offset_table(BlockDriverState *bs,
-                                       QCasDatablkHeader *db_header)
+                                        QCasDatablkHeader *db_header)
 {
     BDRVQcasState *s = bs->opaque;
     QCasFingprtOffsetTblHeader header;
@@ -2090,6 +2090,21 @@ static int find_snapshot_by_id(BlockDriverState *bs, const char *id_str)
     return -1;
 }
 
+static int find_snapshot_by_id_or_name(BlockDriverState *bs, const char *name)
+{
+    BDRVQcasState *s = bs->opaque;
+    int i, ret;
+
+    ret = find_snapshot_by_id(bs, name);
+    if (ret >= 0)
+        return ret;
+    for(i = 0; i < s->nb_snapshots; i++) {
+        if (!strcmp(s->snapshots[i].name, name))
+            return i;
+    }
+    return -1;
+}
+
 static int qcas_write_snapshots(BlockDriverState *bs)
 {   
     BDRVQcasState *s = bs->opaque;
@@ -2200,6 +2215,9 @@ static int qcas_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
         QCasRecipeSector2Fingprt *l1_entry = &s->sec2fingprt_tbl[i];
         QCasDatablkFingprtOffset *l2_entry;
 
+        /* L2 テーブル内のすべてのスナップショットリファレンスカウンタ
+           を無条件に全てカウントアップする */
+
         if (is_nullhash(l1_entry)) continue;
 
         if ((l2_entry = ght_get(s->hash_table, sizeof(QCasFingerprintBlock),
@@ -2248,6 +2266,37 @@ static int qcas_snapshot_goto(BlockDriverState *bs, const char *snapshot_id)
 
 static int qcas_snapshot_delete(BlockDriverState *bs, const char *snapshot_id)
 {
+    BDRVQcasState *s = bs->opaque;
+    QCasSnapshot sn;
+    uint64_t i, count;
+    int snapshot_index, ret;
+
+    /* Search the snapshot */
+    snapshot_index = find_snapshot_by_id_or_name(bs, snapshot_id);
+    if (snapshot_index < 0) {
+        return -ENOENT;
+    }
+    sn = s->snapshots[snapshot_index];
+    
+    /* remote it from the snapshot list */
+    memmove(s->snapshots + snapshot_index,
+            s->snapshots + snapshot_index + 1,
+            (s->nb_snapshots - snapshot_index - 1) * sizeof(sn));
+    s->nb_snapshots--;
+    ret = qcas_write_snapshots(bs);
+    if (ret < 0) {
+        return ret;
+    }
+
+    qemu_vfree(sn.id_str);
+    qemu_vfree(sn.name);
+
+    /* update refcount of entries in l2 table  */
+    count = s->sec2fingprt_tbl_idxcount;     
+    for (i = 0 ; i < count ; i ++) {
+        
+    }
+
     return 0;
 }
 
