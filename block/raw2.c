@@ -14,11 +14,28 @@
 #define RAW2_BLOCK_SIZE   (BDRV_SECTORS_PER_CHUNK << BDRV_SECTOR_BITS)
 #define RAW2_BLOCK_SECTOR (BDRV_SECTORS_PER_CHUNK)
 
+#ifdef DEBUG_RAW2_FILE
+#define DPRINTF(fmt, ...) \
+    do { printf("raw2-format: " fmt, ## __VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
+#ifdef DEBUG_WRITE_BITMAP
+#define BITMAP_DPRINTF(fmt, ...) \
+    do { printf("raw2-bitmap: " fmt, ## __VA_ARGS__); } while (0)
+#else
+#define BITMAP_DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
 typedef struct Raw2Header {
     uint32_t magic;
     uint32_t version;
     uint64_t total_size; /* in bytes */
     uint64_t blocksize;  /* in bytes */
+    uint64_t bitmap_size; /* in bytes */
 } Raw2Header;
 
 #define HEADER_SIZE ((sizeof(Raw2Header) + 511) & ~511)
@@ -27,49 +44,69 @@ typedef struct BDRVRaw2State {
     uint64_t total_size;           /* in bytes  */
     uint64_t blocksize;            /* in bytes  */
     uint64_t raw2_sectors_offset;  /* in bytes  */
-    uint8_t *buf;
+    uint64_t bitmap_size;
+    uint8_t *sha1_buf;
+    uint8_t *bitmap;
 } BDRVRaw2State;
 
 static int raw2_open(BlockDriverState *bs, int flags)
 {    
     BDRVRaw2State *s = bs->opaque;
     Raw2Header header;
-    int ret = 0;   
+    int ret = 0;
 
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
         printf("bdrv_pread: failed: %d\n", ret);
-        goto fail;
+        goto fail_1;
     }
     be32_to_cpus(&header.magic);
     be32_to_cpus(&header.version);
     be64_to_cpus((uint64_t*)&header.total_size);
     be64_to_cpus((uint64_t*)&header.blocksize);
+    be64_to_cpus((uint64_t*)&header.bitmap_size);
+
+    assert(header.bitmap_size == 
+           ((header.total_size >> BDRV_SECTOR_BITS) + 
+            BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1));
+
+    s->bitmap_size = header.bitmap_size;
 
     if (header.magic != RAW2_MAGIC) {
         ret = -EINVAL;
-        goto fail;
+        goto fail_1;
     }
+    
     if (header.version != RAW2_VERSION) {
         char version[64];
         snprintf(version, sizeof(version), "RAW2 version %d", header.version);
         qerror_report(QERR_UNKNOWN_BLOCK_FORMAT_FEATURE,
             bs->device_name, "raw2", version);
         ret = -ENOTSUP;
-        goto fail;
+        goto fail_1;
     }
+
+    s->bitmap = g_malloc(s->bitmap_size);
+    assert(s->bitmap != NULL);
+
+    ret = bdrv_pread(bs->file, HEADER_SIZE, s->bitmap, s->bitmap_size);
+    if (ret < 0) {
+        printf("bdrv_pread: failed: %d\n", ret);
+        g_free(s->bitmap);
+        goto fail_1;
+    }    
 
     s->blocksize  = header.blocksize;
     s->total_size = header.total_size;
-    s->raw2_sectors_offset = HEADER_SIZE;
+    s->raw2_sectors_offset = HEADER_SIZE + header.bitmap_size;
 
     bs->sg = bs->file->sg;
     bs->total_sectors = s->total_size / 512;
     
     return 1;
     
-fail:
-   return ret;
+fail_1:
+    return ret;
 }
 
 static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
@@ -87,13 +124,14 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
     uint8_t sha1_hash[20];
     SHA1_CTX ctx;
     
-    s->buf = qemu_vmalloc(RAW2_BLOCK_SIZE);
+    s->sha1_buf = g_malloc(RAW2_BLOCK_SIZE);
+    assert(s->sha1_buf);
     
     SHA1Init(&ctx);
-    SHA1Update(&ctx, s->buf, RAW2_BLOCK_SIZE);
+    SHA1Update(&ctx, s->sha1_buf, RAW2_BLOCK_SIZE);
     SHA1Final(sha1_hash, &ctx);
 
-    qemu_vfree(s->buf);
+    g_free(s->sha1_buf);
     
     return bdrv_co_writev(bs->file, (s->raw2_sectors_offset / 512) + sector_num, 
                           nb_sectors, qiov);
@@ -102,6 +140,10 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
 static void raw2_close(BlockDriverState *bs)
 {
     BDRVRaw2State *s = bs->opaque;
+    
+    g_free(s->sha1_buf);
+    g_free(s->bitmap);
+
     s->blocksize  = 0;
     s->total_size = 0;
     s->raw2_sectors_offset = 0;
@@ -124,7 +166,7 @@ static int raw2_truncate(BlockDriverState *bs, int64_t offset)
 
 static int raw2_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
-     const Raw2Header *raw2_header = (const void *)buf;
+    const Raw2Header *raw2_header = (const void *)buf;
     if (be32_to_cpu(raw2_header->magic) == RAW2_MAGIC &&
         be32_to_cpu(raw2_header->version) == RAW2_VERSION) {
         return 100;
@@ -177,6 +219,7 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
     BlockDriverState *bs;
     uint8_t *buffer;
     uint64_t size = 0;
+    uint64_t bitmap_size;
     int ret;
 
     /* Read out options */
@@ -207,14 +250,38 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
     header.total_size = cpu_to_be64(size);
     header.blocksize  = cpu_to_be64(RAW2_BLOCK_SIZE);
 
+    bitmap_size = (size >> BDRV_SECTOR_BITS) + 
+        BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1;
+
+    bitmap_size /= BDRV_SECTORS_PER_DIRTY_CHUNK * 8;
+    bitmap_size = (bitmap_size + 511) & ~511; /* 512 align */
+
+    assert(bitmap_size % 512 == 0);    
+    header.bitmap_size  = cpu_to_be64(bitmap_size);
+
     memcpy(buffer, &header, sizeof(header));
     
     ret = bdrv_pwrite(bs, 0, buffer, HEADER_SIZE);
     if (ret < 0) {
         g_free(buffer);
+        bdrv_close(bs);
+        return ret;
+    }    
+    
+    g_free(buffer);    
+
+    /* write bitmap region to disk */
+    buffer = g_malloc(bitmap_size);
+    assert(buffer != NULL);
+    memset(buffer, 0, bitmap_size);
+
+    ret = bdrv_pwrite(bs, HEADER_SIZE, buffer, bitmap_size);
+    if (ret < 0) {
+        g_free(buffer);
+        bdrv_close(bs);
         return ret;
     }
-    
+
     g_free(buffer);
     
     ret = 0;    

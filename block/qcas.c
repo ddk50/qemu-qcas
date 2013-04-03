@@ -2227,6 +2227,7 @@ static int qcas_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
             fprintf(stderr, 
                     "Could not find l2_entry for a fingerprint in l1_table\n"
                     "This image may be broken\n");
+            ret = -1;
             goto fail;
         }
     }
@@ -2249,7 +2250,8 @@ static int qcas_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
         goto fail;
     }
 
-    return 0;
+    ret = 0;
+    return ret;
 
 fail:
     qemu_vfree(sn->id_str);
