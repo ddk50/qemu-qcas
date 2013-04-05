@@ -1,7 +1,9 @@
 
+#ifndef __RAW2_EXTERNAL_TESTING__
 #include "qemu-common.h"
 #include "block_int.h"
 #include "module.h"
+#endif
 
 #include "sha1.h"
 
@@ -30,30 +32,123 @@
     do { } while (0)
 #endif
 
-typedef struct Raw2Header {
+typedef struct QEMU_PACKED hash_entry {
+    uint8_t sha1_hash[20];
+} hash_entry;
+
+typedef struct QEMU_PACKED Raw2Header {
     uint32_t magic;
     uint32_t version;
     uint64_t total_size; /* in bytes */
     uint64_t blocksize;  /* in bytes */
-    uint64_t bitmap_size; /* in bytes */
+    uint32_t bitmap_checksum;
+    uint64_t bitmap_size; /* in bytes */    
+    uint32_t sha1_buf_checksum;
+    uint64_t sha1_buf_size;
+    uint8_t bitmap[0];
+    hash_entry sha1_buf[0];
 } Raw2Header;
 
 #define HEADER_SIZE ((sizeof(Raw2Header) + 511) & ~511)
 
-typedef struct BDRVRaw2State {
+typedef struct QEMU_PACKED BDRVRaw2State {
     uint64_t total_size;           /* in bytes  */
     uint64_t blocksize;            /* in bytes  */
     uint64_t raw2_sectors_offset;  /* in bytes  */
-    uint64_t bitmap_size;
+    uint64_t sha1_buf_size;
     uint8_t *sha1_buf;
-    uint8_t *bitmap;
+    uint64_t bitmap_size;
+    uint8_t *bitmap;    
 } BDRVRaw2State;
+
+static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
+                             int nb_sectors, int dirty);
+
+static int get_dirty(BDRVRaw2State *s, int64_t sector);
+
+static uint32_t crc32_le(const uint8_t *buf, int len);
+
+static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
+                             int nb_sectors, int dirty)
+{    
+    BDRVRaw2State *s = bs->opaque;
+    int64_t start, end;
+    unsigned long val, idx, bit;
+    start = sector_num / BDRV_SECTORS_PER_DIRTY_CHUNK;
+    end = (sector_num + nb_sectors - 1) / BDRV_SECTORS_PER_DIRTY_CHUNK;
+
+    for (; start <= end; start++) {
+        idx = start / (sizeof(unsigned long) * 8);
+        bit = start % (sizeof(unsigned long) * 8);
+        val = s->bitmap[idx];
+        val |= 1UL << bit;
+        s->bitmap[idx] = val;
+    }
+}
+
+static int get_dirty(BDRVRaw2State *s, int64_t sector)
+{    
+    int64_t chunk = sector / (int64_t)BDRV_SECTORS_PER_DIRTY_CHUNK;
+    if (s->bitmap &&
+        (sector << BDRV_SECTOR_BITS) < s->total_size) {        
+        return !!(s->bitmap[chunk / (sizeof(unsigned long) * 8)] &
+                  (1UL << (chunk % (sizeof(unsigned long) * 8))));
+    } else {
+        return 0;
+    }
+}
+
+static uint32_t crc32_le(const uint8_t *buf, int len)
+{	
+    uint32_t crc;
+    int	i;
+	static const uint32_t crctab[] = {
+		0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+		0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+		0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+		0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+	};
+	
+	crc = 0xffffffffU;/* initial value */
+	
+	for (i = 0; i < len; i++) {
+		crc ^= buf[i];
+		crc = (crc >> 4) ^ crctab[crc & 0xf];
+		crc = (crc >> 4) ^ crctab[crc & 0xf];
+	}
+	
+	return crc;
+}
+
+static int validate_header(BlockDriverState *bs, 
+                           Raw2Header *header, 
+                           uint8_t *sha1_buf, 
+                           uint8_t *bitmap)
+{
+    uint32_t crc32;
+
+    crc32 = crc32_le(sha1_buf, header->sha1_buf_size);   
+    if (header->sha1_buf_checksum != crc32) {
+        fprintf(stderr, "sha1_buf is broken\n");
+        return -1;
+    }
+
+    crc32 = crc32_le(bitmap, header->bitmap_size);
+    if (header->bitmap_checksum != crc32) {
+        fprintf(stderr, "bitmap is broken\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 static int raw2_open(BlockDriverState *bs, int flags)
 {    
     BDRVRaw2State *s = bs->opaque;
     Raw2Header header;
     int ret = 0;
+
+    fprintf(stderr, "============ %s ===========\n", __FUNCTION__);
 
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
@@ -62,13 +157,18 @@ static int raw2_open(BlockDriverState *bs, int flags)
     }
     be32_to_cpus(&header.magic);
     be32_to_cpus(&header.version);
-    be64_to_cpus((uint64_t*)&header.total_size);
-    be64_to_cpus((uint64_t*)&header.blocksize);
-    be64_to_cpus((uint64_t*)&header.bitmap_size);
-
+    be64_to_cpus(&header.total_size);
+    be64_to_cpus(&header.blocksize);
+    be32_to_cpus(&header.bitmap_checksum);
+    be64_to_cpus(&header.bitmap_size);
+    be32_to_cpus(&header.sha1_buf_checksum);
+    be64_to_cpus(&header.sha1_buf_size);
+    
+    assert(header.bitmap_size % 512 == 0);
     assert(header.bitmap_size == 
-           ((header.total_size >> BDRV_SECTOR_BITS) + 
-            BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1));
+           ((((((header.total_size >> BDRV_SECTOR_BITS) + 
+               BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1)) / (BDRV_SECTORS_PER_DIRTY_CHUNK * 8))
+             + 511) & ~511));
 
     s->bitmap_size = header.bitmap_size;
 
@@ -86,25 +186,49 @@ static int raw2_open(BlockDriverState *bs, int flags)
         goto fail_1;
     }
 
-    s->bitmap = g_malloc(s->bitmap_size);
+    s->bitmap = g_malloc0(s->bitmap_size);
     assert(s->bitmap != NULL);
 
     ret = bdrv_pread(bs->file, HEADER_SIZE, s->bitmap, s->bitmap_size);
     if (ret < 0) {
-        printf("bdrv_pread: failed: %d\n", ret);
-        g_free(s->bitmap);
-        goto fail_1;
-    }    
+        printf("bdrv_pread failed: %d\n", ret);
+        goto fail_2;
+    }
+
+    /* read out sha1 buffer */
+    s->sha1_buf_size = header.sha1_buf_size;
+    s->sha1_buf = g_malloc0(s->sha1_buf_size);
+    assert(s->sha1_buf != NULL);
+
+    ret = bdrv_pread(bs->file, HEADER_SIZE + header.bitmap_size, 
+                     s->sha1_buf, s->sha1_buf_size);
+    if (ret < 0) {
+        printf("bdrv_pread failed: %d\n", ret);        
+        goto fail_3;
+    }
+
+    ret = validate_header(bs, &header, s->sha1_buf, s->bitmap);
+    if (ret < 0) {        
+        printf("validate failed: %d\n", ret);
+        ret = -EINVAL;
+        goto fail_3;
+    }
 
     s->blocksize  = header.blocksize;
     s->total_size = header.total_size;
-    s->raw2_sectors_offset = HEADER_SIZE + header.bitmap_size;
+    s->raw2_sectors_offset = HEADER_SIZE + header.bitmap_size 
+        + header.sha1_buf_size;
+    assert(s->raw2_sectors_offset % 512 == 0);
 
-    bs->sg = bs->file->sg;
+    //    bs->sg = bs->file->sg;
     bs->total_sectors = s->total_size / 512;
     
     return 1;
     
+fail_3:
+    g_free(s->sha1_buf);
+fail_2:
+    g_free(s->bitmap);
 fail_1:
     return ret;
 }
@@ -113,6 +237,9 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
                                      int nb_sectors, QEMUIOVector *qiov)
 {
     BDRVRaw2State *s = bs->opaque;
+    assert(s->raw2_sectors_offset != 0);
+    fprintf(stderr, "%s : s->raw2_sectors_offset: 0x%llx\n", 
+            __FUNCTION__, s->raw2_sectors_offset);
     return bdrv_co_readv(bs->file, (s->raw2_sectors_offset / 512) + sector_num, 
                          nb_sectors, qiov);
 }
@@ -121,26 +248,112 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
                                       int nb_sectors, QEMUIOVector *qiov)
 {
     BDRVRaw2State *s = bs->opaque;
-    uint8_t sha1_hash[20];
-    SHA1_CTX ctx;
+//    uint8_t sha1_hash[20];
+//    SHA1_CTX ctx;
     
-    s->sha1_buf = g_malloc(RAW2_BLOCK_SIZE);
-    assert(s->sha1_buf);
+    /* s->sha1_buf = g_malloc0(RAW2_BLOCK_SIZE); */
+    /* assert(s->sha1_buf); */
     
-    SHA1Init(&ctx);
-    SHA1Update(&ctx, s->sha1_buf, RAW2_BLOCK_SIZE);
-    SHA1Final(sha1_hash, &ctx);
+    /* SHA1Init(&ctx); */
+    /* SHA1Update(&ctx, s->sha1_buf, RAW2_BLOCK_SIZE); */
+    /* SHA1Final(sha1_hash, &ctx); */
 
-    g_free(s->sha1_buf);
-    
-    return bdrv_co_writev(bs->file, (s->raw2_sectors_offset / 512) + sector_num, 
+    /* g_free(s->sha1_buf); */
+    if (!get_dirty(s, sector_num)) {
+        set_dirty_bitmap(bs, sector_num, nb_sectors, 1);
+    }
+    assert(s->raw2_sectors_offset != 0);
+    fprintf(stderr, "%s : s->raw2_sectors_offset: 0x%llx\n", 
+            __FUNCTION__, s->raw2_sectors_offset);
+    return bdrv_co_writev(bs->file, (s->raw2_sectors_offset / 512) + sector_num,
                           nb_sectors, qiov);
+}
+
+static int reconstruct_header(BlockDriverState *bs,
+                              uint8_t *bitmap)
+{
+    BDRVRaw2State *s = bs->opaque;
+    Raw2Header header, header2;
+    uint32_t crc32;
+    int ret = 0;
+
+    ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
+    if (ret < 0) {
+        printf("%s bdrv_pread failed: %d\n", __FUNCTION__, ret);
+        return ret;
+    }
+
+    memcpy(&header2, &header, sizeof(header));
+
+    /* TODO: ここの処理がおかしい、 */
+    be32_to_cpus(&header.magic);
+    be32_to_cpus(&header.version);
+    be64_to_cpus(&header.total_size);
+    be64_to_cpus(&header.blocksize);
+    be32_to_cpus(&header.bitmap_checksum);
+    be64_to_cpus(&header.bitmap_size);
+    be32_to_cpus(&header.sha1_buf_checksum);
+    be64_to_cpus(&header.sha1_buf_size);
+
+    assert(s->bitmap_size == header.bitmap_size);
+    assert(s->sha1_buf_size == header.sha1_buf_size);   
+
+    assert(header.bitmap_size % 512 == 0);
+    assert(header.bitmap_size == 
+           ((((((header.total_size >> BDRV_SECTOR_BITS) + 
+               BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1)) / (BDRV_SECTORS_PER_DIRTY_CHUNK * 8))
+             + 511) & ~511));
+
+    assert(header.magic == RAW2_MAGIC);
+    assert(header.version == RAW2_VERSION);
+
+    crc32 = crc32_le(s->bitmap, header.bitmap_size);
+    header2.bitmap_checksum = cpu_to_be32(crc32);
+
+    crc32 = crc32_le(s->sha1_buf, header.sha1_buf_size);
+    header2.sha1_buf_checksum = cpu_to_be32(crc32);
+
+    /* write the new header to disk */
+    ret = bdrv_pwrite(bs->file, 0, &header2, sizeof(header2));
+    if (ret < 0) {
+        fprintf(stderr, "%s write header failed\n", 
+                __FUNCTION__);
+        return ret;
+    }
+
+    /* write the bitmap to disk */
+    ret = bdrv_pwrite(bs->file, HEADER_SIZE, bitmap, s->bitmap_size);
+    if (ret < 0) {
+        fprintf(stderr, "%s writing bitmap failed\n", 
+                __FUNCTION__);
+        return ret;
+    }
+
+    /* write the sha1 list to disk */
+    ret = bdrv_pwrite(bs->file, HEADER_SIZE + s->bitmap_size, 
+                      s->sha1_buf, s->sha1_buf_size);
+    if (ret < 0) {
+        fprintf(stderr, "%s writing sha1 list failed\n", 
+                __FUNCTION__);
+        return ret;
+    }
+
+    bdrv_flush(bs);
+
+    return ret;
 }
 
 static void raw2_close(BlockDriverState *bs)
 {
     BDRVRaw2State *s = bs->opaque;
-    
+    int ret;
+
+    /* TODO: write bitmap to disk */
+    ret = reconstruct_header(bs, s->bitmap);
+    if (ret < 0) {
+        fprintf(stderr, "Could not re-construct header\n");
+    }
+
     g_free(s->sha1_buf);
     g_free(s->bitmap);
 
@@ -151,7 +364,9 @@ static void raw2_close(BlockDriverState *bs)
 
 static int coroutine_fn raw2_co_flush(BlockDriverState *bs)
 {
-    return bdrv_co_flush(bs->file);
+//    return bdrv_co_flush(bs->file);
+//    bdrv_co_flush(
+    return 0;
 }
 
 static int64_t raw2_getlength(BlockDriverState *bs)
@@ -161,16 +376,26 @@ static int64_t raw2_getlength(BlockDriverState *bs)
 
 static int raw2_truncate(BlockDriverState *bs, int64_t offset)
 {
-    return bdrv_truncate(bs->file, offset);
+  //    return bdrv_truncate(bs->file, offset);
+    return -1;
 }
 
 static int raw2_probe(const uint8_t *buf, int buf_size, const char *filename)
 {
     const Raw2Header *raw2_header = (const void *)buf;
+
+
+    fprintf(stderr, 
+            "raw2 header magic = 0x%x | read header magic = 0x%x\n"
+            "raw2 header version = 0x%x | read header version = 0x%x\n",
+            RAW2_MAGIC, be32_to_cpu(raw2_header->magic),
+            RAW2_VERSION, be32_to_cpu(raw2_header->version));
+    
     if (be32_to_cpu(raw2_header->magic) == RAW2_MAGIC &&
         be32_to_cpu(raw2_header->version) == RAW2_VERSION) {
         return 100;
     } else {
+        fprintf(stderr, "%s It's not raw2 file\n", __FUNCTION__);
         return 0;
     }
 }
@@ -178,7 +403,9 @@ static int raw2_probe(const uint8_t *buf, int buf_size, const char *filename)
 static int coroutine_fn raw2_co_discard(BlockDriverState *bs,
                                        int64_t sector_num, int nb_sectors)
 {
-    return bdrv_co_discard(bs->file, sector_num, nb_sectors);
+//    return bdrv_co_discard(bs->file, sector_num, nb_sectors);
+    fprintf(stderr, "Called discard\n");
+    return -1;
 }
 
 static int raw2_is_inserted(BlockDriverState *bs)
@@ -217,9 +444,11 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
 {
     Raw2Header header;
     BlockDriverState *bs;
-    uint8_t *buffer;
+    uint8_t *bitmap_buf;
+    uint8_t *sha1_buf;
     uint64_t size = 0;
-    uint64_t bitmap_size;
+    uint64_t bitmap_size, sha1_buf_size;
+    uint64_t sha1_count;
     int ret;
 
     /* Read out options */
@@ -240,51 +469,65 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
         return ret;
     }
 
-    buffer = g_malloc0(HEADER_SIZE);    
-    assert(buffer != NULL);
-    memset(buffer, 0, HEADER_SIZE);
-
     memset(&header, 0, sizeof(header));
-    header.magic      = cpu_to_be32(RAW2_MAGIC);
-    header.version    = cpu_to_be32(RAW2_VERSION);
-    header.total_size = cpu_to_be64(size);
-    header.blocksize  = cpu_to_be64(RAW2_BLOCK_SIZE);
+    header.magic           = cpu_to_be32(RAW2_MAGIC);
+    header.version         = cpu_to_be32(RAW2_VERSION);
+    header.total_size      = cpu_to_be64(size);
+    header.blocksize       = cpu_to_be64(RAW2_BLOCK_SIZE);
 
+    /* prepare null buffer for checksum */   
     bitmap_size = (size >> BDRV_SECTOR_BITS) + 
         BDRV_SECTORS_PER_DIRTY_CHUNK * 8 - 1;
 
     bitmap_size /= BDRV_SECTORS_PER_DIRTY_CHUNK * 8;
     bitmap_size = (bitmap_size + 511) & ~511; /* 512 align */
 
+    bitmap_buf = g_malloc0(bitmap_size);
+    memset(bitmap_buf, 0, bitmap_size);
+
+    /* calclate initialize CRC value of NULL buffer */
+    header.bitmap_checksum = cpu_to_be32(crc32_le(bitmap_buf, bitmap_size));
+
     assert(bitmap_size % 512 == 0);    
     header.bitmap_size  = cpu_to_be64(bitmap_size);
 
-    memcpy(buffer, &header, sizeof(header));
+    /* sha1 */
+    sha1_count = (size / RAW2_BLOCK_SIZE);
+    sha1_buf_size = sha1_count * sizeof(hash_entry);
+    if ((sha1_count * RAW2_BLOCK_SIZE) != sha1_buf_size) {
+        sha1_buf_size = (sha1_count + 1) * sizeof(hash_entry);
+    }
+    sha1_buf_size = (sha1_buf_size + 511) & ~511; /* 512 align */    
     
-    ret = bdrv_pwrite(bs, 0, buffer, HEADER_SIZE);
-    if (ret < 0) {
-        g_free(buffer);
-        bdrv_close(bs);
-        return ret;
-    }    
+    sha1_buf = g_malloc0(sha1_buf_size);
+    assert(sha1_buf != NULL);
+    memset(sha1_buf, 0, sha1_buf_size);    
+
+    header.sha1_buf_size     = cpu_to_be64(sha1_buf_size);
+    header.sha1_buf_checksum = cpu_to_be32(crc32_le(sha1_buf, sha1_buf_size));
     
-    g_free(buffer);    
-
-    /* write bitmap region to disk */
-    buffer = g_malloc(bitmap_size);
-    assert(buffer != NULL);
-    memset(buffer, 0, bitmap_size);
-
-    ret = bdrv_pwrite(bs, HEADER_SIZE, buffer, bitmap_size);
+    ret = bdrv_pwrite(bs, 0, &header, sizeof(header));
     if (ret < 0) {
-        g_free(buffer);
-        bdrv_close(bs);
-        return ret;
+        goto failed;
     }
 
-    g_free(buffer);
+    /* write bitmap region to disk */
+    ret = bdrv_pwrite(bs, HEADER_SIZE, bitmap_buf, bitmap_size);
+    if (ret < 0) {
+        goto failed;
+    }
+
+    ret = bdrv_pwrite(bs, HEADER_SIZE + bitmap_size, sha1_buf, sha1_buf_size);
+    if (ret < 0) {
+        goto failed;
+    }
+
+    ret = 0;
+
+failed:
+    g_free(bitmap_buf);
+    g_free(sha1_buf);
     
-    ret = 0;    
     bdrv_close(bs);
     
     return ret;
