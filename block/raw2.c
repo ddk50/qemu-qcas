@@ -220,13 +220,11 @@ static int raw2_open(BlockDriverState *bs, int flags)
         goto fail_3;
     }
 
-    if (!bs->read_only) {
-        ret = validate_header(bs, &header, s->sha1_buf, s->bitmap);
-        if (ret < 0) {        
-            printf("validate failed: %d\n", ret);
-            ret = -EINVAL;
-            goto fail_3;
-        }
+    ret = validate_header(bs, &header, s->sha1_buf, s->bitmap);
+    if (ret < 0) {        
+      printf("validate failed: %d\n", ret);
+      ret = -EINVAL;
+      goto fail_3;
     }
 
     s->blocksize  = header.blocksize;
@@ -375,9 +373,12 @@ static void raw2_close(BlockDriverState *bs)
     /* } */
 
     /* TODO: write bitmap to disk */
-    ret = reconstruct_header(bs, s->bitmap);
-    if (ret < 0) {
-        fprintf(stderr, "Could not re-construct header\n");
+    
+    if (!bs->read_only) {
+        ret = reconstruct_header(bs, s->bitmap);
+        if (ret < 0) {
+            fprintf(stderr, "Could not re-construct header\n");
+        }
     }
 
     g_free(s->sha1_buf);
