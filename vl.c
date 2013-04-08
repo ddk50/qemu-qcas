@@ -2165,22 +2165,6 @@ static void free_and_trace(gpointer mem)
     free(mem);
 }
 
-/********************************************/
-/* for disk logging timer for kazushi */
-
-typedef struct DiskLoggingState {
-    QEMUTimer *dl_timer;    
-} DiskLoggingState;
-
-static void disklog_update(void *opaque)
-{
-    uint64_t interval = 1000; /* 1 sec ? */
-    DiskLoggingState *dls = (DiskLoggingState*)opaque;
-    
-    fprintf(stderr, "****** timer test ******\n");
-    qemu_mod_timer(dls->dl_timer, interval + qemu_get_clock_ms(rt_clock));
-}
-
 #ifdef CONFIG_KVM_OPTIONS
 int kvm_irqchip = 1;
 int kvm_pit = 1;
@@ -3563,19 +3547,12 @@ int main(int argc, char **argv, char **envp)
     os_setup_post();
 
     resume_all_vcpus();
-
-    /* setup timer for disk logging */
-    static DiskLoggingState dls;
-    dls.dl_timer = qemu_new_timer_ms(rt_clock, disklog_update, &dls);
-    qemu_mod_timer(dls.dl_timer, qemu_get_clock_ms(rt_clock));
     
     main_loop();
     bdrv_close_all();    
     pause_all_vcpus();
     net_cleanup();
     res_free();
-
-    qemu_free_timer(dls.dl_timer);
 
     return 0;
 }

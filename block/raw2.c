@@ -251,8 +251,8 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
 {
     BDRVRaw2State *s = bs->opaque;
     assert(s->raw2_sectors_offset != 0);
-    fprintf(stderr, "%s : s->raw2_sectors_offset: 0x%llx\n", 
-            __FUNCTION__, s->raw2_sectors_offset);
+    /* fprintf(stderr, "%s : s->raw2_sectors_offset: 0x%llx\n",  */
+    /*         __FUNCTION__, s->raw2_sectors_offset); */
     return bdrv_co_readv(bs->file, (s->raw2_sectors_offset / 512) + sector_num, 
                          nb_sectors, qiov);
 }
@@ -280,8 +280,8 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
     /* } */
     set_dirty_bitmap(bs, sector_num, nb_sectors, 1);
     
-    fprintf(stderr, "%s 0x%016llx -- 0x%016llx\n", 
-            __FUNCTION__, sector_num, sector_num + nb_sectors);
+    /* fprintf(stderr, "%s 0x%016llx -- 0x%016llx\n",  */
+    /*         __FUNCTION__, sector_num, sector_num + nb_sectors); */
     
     return bdrv_co_writev(bs->file, (s->raw2_sectors_offset / 512) + sector_num,
                           nb_sectors, qiov);
@@ -457,7 +457,18 @@ static void raw2_lock_medium(BlockDriverState *bs, bool locked)
 
 static int raw2_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
 {
-   return bdrv_ioctl(bs->file, req, buf);
+    int ret;    
+    switch (req) {
+    case 0x07214545:
+        /* record dirty bits of disk and clear them */
+        fprintf(stderr, "****** timer test from raw2 ******\n");
+        break;
+    default:
+        ret = -1;
+        break;
+    }
+
+    return ret;
 }
 
 static BlockDriverAIOCB *raw2_aio_ioctl(BlockDriverState *bs,

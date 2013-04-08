@@ -98,6 +98,15 @@ static BlockDriverState *bs_snapshots;
 /* If non-zero, use only whitelisted block drivers */
 static int use_bdrv_whitelist;
 
+/* disk logging timer */
+/********************************************/
+/* for disk logging timer for kazushi */
+typedef struct DiskLoggingState {
+    QEMUTimer *dl_timer;    
+} DiskLoggingState;
+
+static DiskLoggingState dls;
+
 #ifdef _WIN32
 static int is_windows_drive_prefix(const char *filename)
 {
@@ -849,6 +858,9 @@ void bdrv_close_all(void)
     QTAILQ_FOREACH(bs, &bdrv_states, list) {
         bdrv_close(bs);
     }
+
+    /* free for disk loggin timer handler */
+    qemu_free_timer(dls.dl_timer);
 }
 
 /*
@@ -3275,6 +3287,20 @@ BlockDriverAIOCB *bdrv_aio_discard(BlockDriverState *bs,
     return &acb->common;
 }
 
+static void bdrv_disklog_update(void *opaque)
+{
+    uint64_t interval = 1000; /* 1 sec ? */
+    BlockDriverState *bs;
+    DiskLoggingState *dls = (DiskLoggingState*)opaque;
+    
+    qemu_mod_timer(dls->dl_timer, interval + qemu_get_clock_ms(rt_clock));
+
+    QTAILQ_FOREACH(bs, &bdrv_states, list) {        
+        /* record dirty bits of disk and clear them */        
+        bdrv_ioctl(bs, 0x07214545, NULL);
+    }
+}
+
 void bdrv_init(void)
 {
     module_call_init(MODULE_INIT_BLOCK);
@@ -3282,8 +3308,12 @@ void bdrv_init(void)
 
 void bdrv_init_with_whitelist(void)
 {
-    use_bdrv_whitelist = 1;
+    use_bdrv_whitelist = 1;    
     bdrv_init();
+    
+    /* initialize disk logging timer handler */
+    dls.dl_timer = qemu_new_timer_ms(rt_clock, bdrv_disklog_update, &dls);
+    qemu_mod_timer(dls.dl_timer, qemu_get_clock_ms(rt_clock));
 }
 
 void *qemu_aio_get(AIOPool *pool, BlockDriverState *bs,
