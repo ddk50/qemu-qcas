@@ -43,7 +43,7 @@ typedef struct QEMU_PACKED Raw2Header {
     uint64_t total_size; /* in bytes */
     uint64_t blocksize;  /* in bytes */
     uint32_t bitmap_checksum;
-    uint64_t bitmap_size; /* in bytes */    
+    uint64_t bitmap_size; /* in bytes */
     uint32_t sha1_buf_checksum;
     uint64_t sha1_buf_size;
     uint32_t bitmap[0];
@@ -61,11 +61,13 @@ typedef struct QEMU_PACKED BDRVRaw2State {
     uint64_t bitmap_size;
     unsigned long *bitmap;
     int appeared;
+    time_t logging_time;
 } BDRVRaw2State;
 
 static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
                              int nb_sectors, int dirty);
 int get_dirty(BDRVRaw2State *s, int64_t sector);
+void clear_dirtylog(BDRVRaw2State *s);
 
 static uint32_t crc32_le(const void *buf, int len);
 
@@ -107,6 +109,11 @@ int get_dirty(BDRVRaw2State *s, int64_t sector)
     } else {
         return 0;
     }
+}
+
+void clear_dirtylog(BDRVRaw2State *s)
+{
+    memset((uint8_t*)s->bitmap, 0, s->bitmap_size);
 }
 
 static uint32_t crc32_le(const void *buf, int len)
@@ -458,10 +465,47 @@ static void raw2_lock_medium(BlockDriverState *bs, bool locked)
 static int raw2_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
 {
     int ret;    
+    BDRVRaw2State *s = bs->opaque;
+    struct tm *tmp;
+    char logfname[255];
+    FILE *fp;
+    uint64_t i, n_page;
+
     switch (req) {
     case 0x07214545:
+        
         /* record dirty bits of disk and clear them */
-        fprintf(stderr, "****** timer test from raw2 ******\n");
+        fprintf(stderr, "****** output logging ******\n");
+        time(&s->logging_time);
+        tmp = localtime(&s->logging_time);
+        
+        snprintf(logfname, 255 - 1, "%d%02d%02d%02d%02d%02d.log",
+                 tmp->tm_year + 1900, tmp->tm_mon, tmp->tm_mday,
+                 tmp->tm_hour, tmp->tm_min, tmp->tm_sec);
+
+        n_page = s->sha1_buf_size / sizeof(hash_entry);
+
+        if ((fp = fopen(logfname, "w")) == NULL) {
+            ret = -1;
+            fprintf(stderr, "%s open log file error\n", logfname);
+            break;
+        }
+
+        for (i = 0 ; i < n_page ; ++i) {
+            int r;
+            assert((i * RAW2_BLOCK_SIZE) % 512 == 0);
+            r = get_dirty(s, (i * RAW2_BLOCK_SIZE) / 512);
+            
+            putc(r ? '1' : '0', fp);
+            if ((i + 1) < n_page) {
+                putc(',', fp);
+            }
+        }
+
+        fclose(fp);
+        
+        clear_dirtylog(s);
+        
         break;
     default:
         ret = -1;
