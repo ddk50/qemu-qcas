@@ -7,14 +7,22 @@
 
 #include "sha1.h"
 
+#include <mysql.h>
+#include <uuid/uuid.h>
+
 #define RAW2_MAGIC (('R' << 24) | ('A' << 16) | ('W' << 8) | '2')
 #define RAW2_VERSION 1
 
 #define BDRV_SECTOR_BITS       9
-#define BDRV_SECTORS_PER_CHUNK 2048
+//#define BDRV_SECTORS_PER_CHUNK 4096 // (4096 -> 2MB)
+//#define BDRV_SECTORS_PER_CHUNK 2048 // (2048 -> 1MB)
+#define BDRV_SECTORS_PER_CHUNK 8 // (8 -> 4KB)
 
 #define RAW2_BLOCK_SIZE   (BDRV_SECTORS_PER_CHUNK << BDRV_SECTOR_BITS)
 #define RAW2_BLOCK_SECTOR (BDRV_SECTORS_PER_CHUNK)
+
+#define SEC2BYTE(sector) (((sector) << BDRV_SECTOR_BITS))
+#define BYTE2SEC(byte)   ((byte) >> BDRV_SECTOR_BITS)
 
 #ifdef DEBUG_RAW2_FILE
 #define DPRINTF(fmt, ...) \
@@ -32,6 +40,8 @@
     do { } while (0)
 #endif
 
+#define MAX_STR_LEN 255
+
 typedef struct QEMU_PACKED hash_entry {
     uint8_t sha1_hash[20];
 } hash_entry;
@@ -46,6 +56,7 @@ typedef struct QEMU_PACKED Raw2Header {
     uint64_t bitmap_size; /* in bytes */
     uint32_t sha1_buf_checksum;
     uint64_t sha1_buf_size;
+    uint8_t  uuid_sign[37];
     uint32_t bitmap[0];
     hash_entry sha1_buf[0];
 } Raw2Header;
@@ -55,21 +66,96 @@ typedef struct QEMU_PACKED Raw2Header {
 typedef struct QEMU_PACKED BDRVRaw2State {
     uint64_t total_size;           /* in bytes  */
     uint64_t blocksize;            /* in bytes  */
-    uint64_t raw2_sectors_offset;  /* in bytes  */
+    uint64_t raw2_header_offset;  /* in bytes  */
     uint64_t sha1_buf_size;
     hash_entry *sha1_buf;
     uint64_t bitmap_size;
     unsigned long *bitmap;
     int appeared;
     time_t logging_time;
+    MYSQL *conn;
+    uint8_t uuid_sign[37];
 } BDRVRaw2State;
 
-static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
-                             int nb_sectors, int dirty);
-int get_dirty(BDRVRaw2State *s, int64_t sector);
-void clear_dirtylog(BDRVRaw2State *s);
+//const char *sql_server = "ol-observer";
+const char *sql_server = "localhost";
+const char *sql_user = "kazushi";
+const char *sql_password = "TheXYA";
+const char *sql_database = "dirichlet_cachemodel_20130417";
+const char *sql_table = "sha1set";
 
 static uint32_t crc32_le(const void *buf, int len);
+static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
+                             int nb_sectors, int dirty);
+
+int get_dirty(BDRVRaw2State *s, int64_t sector);
+void clear_dirtylog(BDRVRaw2State *s);
+int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen);
+
+int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen)
+{
+    static char digitx[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    int i, j;
+    
+    memset(ostr, '\0', max_slen);
+
+    for (i = 0, j = 0 ; i < buf_len ; i++, j += 2) {
+        if (j >= max_slen) {
+            goto err;
+        }
+        ostr[j]   = digitx[(((uint8_t*)buf)[i] >> 4) & 0xf];
+        ostr[j+1] = digitx[((uint8_t*)buf)[i] & 0xf];
+    }
+    return 1;
+err:
+    return 0;
+}
+
+typedef struct db_value {
+    SHA1_CTX ctx;
+    uint8_t sha1_hash[20];
+} db_value;
+
+static int format_sql_insert(char *sql_query, int n_pages, 
+                             const char *sql_database, uint8_t *cluster)
+{    
+    int i;
+    int ret;
+    char tmp_SQLquery[MAX_STR_LEN + 1];
+    char asciihash[MAX_STR_LEN + 1];
+    char *ret_str = sql_query;
+    db_value value;
+
+    snprintf(sql_query, MAX_STR_LEN, "INSERT INTO %s.%s(sha1) VALUES",                                                                                                                                      sql_database, sql_table);
+    
+    for (i = 0 ; i < n_pages ; i++) {
+        
+        SHA1Init(&value.ctx); {
+            SHA1Update(&value.ctx, cluster + (i * RAW2_BLOCK_SIZE), RAW2_BLOCK_SIZE);
+        }; SHA1Final(value.sha1_hash, &value.ctx);
+
+        ret = bin2ascii(value.sha1_hash, sizeof(value.sha1_hash), 
+                        asciihash, MAX_STR_LEN);
+        if (!ret) {
+            fprintf(stderr, "bin2ascii error\n");
+            ret = -1;
+            goto fail;
+        }
+
+        if (i == (n_pages - 1)) {
+          snprintf(tmp_SQLquery, MAX_STR_LEN, " ('%s')", asciihash);
+        } else {
+          snprintf(tmp_SQLquery, MAX_STR_LEN, " ('%s'),", asciihash);
+        }
+        strcat(ret_str, tmp_SQLquery);
+    }
+
+    return 0;
+    
+fail:
+    return ret;
+
+}
 
 static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
                              int nb_sectors, int dirty)
@@ -189,6 +275,7 @@ static int raw2_open(BlockDriverState *bs, int flags)
              + 511) & ~511));
 
     s->bitmap_size = header.bitmap_size;
+    memcpy(s->uuid_sign, header.uuid_sign, 37);
 
     if (header.magic != RAW2_MAGIC) {
         ret = -EINVAL;
@@ -236,12 +323,26 @@ static int raw2_open(BlockDriverState *bs, int flags)
 
     s->blocksize  = header.blocksize;
     s->total_size = header.total_size;
-    s->raw2_sectors_offset = HEADER_SIZE + header.bitmap_size 
+    s->raw2_header_offset = HEADER_SIZE + header.bitmap_size 
         + header.sha1_buf_size;
-    assert(s->raw2_sectors_offset % 512 == 0);
+    assert(s->raw2_header_offset % 512 == 0);
 
     //    bs->sg = bs->file->sg;
     bs->total_sectors = s->total_size / 512;
+
+    /* connect to mysql server */
+    s->conn = mysql_init(NULL);
+    fprintf(stdout, "connecting database ...");
+    fflush(stdout);
+    if (mysql_real_connect(s->conn, sql_server, sql_user, 
+                           sql_password, sql_database,
+                           0, NULL, 0) == NULL) {
+        fprintf(stderr, "Cloud not connect to database %u: %s\n",
+                mysql_errno(s->conn), mysql_error(s->conn));
+        ret = -1;
+        goto fail_3;
+    }
+    fprintf(stdout, "Done\n");
     
     return 1;
     
@@ -257,11 +358,63 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
                                      int nb_sectors, QEMUIOVector *qiov)
 {
     BDRVRaw2State *s = bs->opaque;
-    assert(s->raw2_sectors_offset != 0);
-    /* fprintf(stderr, "%s : s->raw2_sectors_offset: 0x%llx\n",  */
-    /*         __FUNCTION__, s->raw2_sectors_offset); */
-    return bdrv_co_readv(bs->file, (s->raw2_sectors_offset / 512) + sector_num, 
-                         nb_sectors, qiov);
+    uint64_t page_index;
+    uint64_t inblock_offset;
+    int n_pages;
+    int ret;
+    uint8_t *cluster;
+    char *SQLquery_buf;
+
+    assert(s->raw2_header_offset != 0);
+
+    page_index     = SEC2BYTE(sector_num) / RAW2_BLOCK_SIZE;
+    inblock_offset = SEC2BYTE(sector_num) % RAW2_BLOCK_SIZE;
+    n_pages        = ((SEC2BYTE(nb_sectors) + (RAW2_BLOCK_SIZE - 1)) 
+                      & ~(RAW2_BLOCK_SIZE - 1)) / RAW2_BLOCK_SIZE;
+    assert(n_pages >= 1);
+
+    fprintf(stderr, "nb_sectors: %d, pages: %d\n", nb_sectors, n_pages);
+
+    cluster = g_malloc0(n_pages * RAW2_BLOCK_SIZE);
+    assert(cluster != NULL);
+    
+    SQLquery_buf = g_malloc0(4 * 1024 * 1024);
+    assert(SQLquery_buf != NULL);
+
+    ret = bdrv_pread(bs->file, s->raw2_header_offset + (page_index * RAW2_BLOCK_SIZE),
+                     cluster, (n_pages * RAW2_BLOCK_SIZE));
+    if (ret < 0) {
+        fprintf(stderr, "readv error\n");
+        g_free(cluster);
+        goto fail;
+    }
+
+    //    qemu_iovec_from_buffer(qiov, cluster + inblock_offset, 
+    //                           SEC2BYTE(nb_sectors));
+    ret = format_sql_insert(SQLquery_buf, n_pages, sql_database, cluster);
+    if (ret < 0) {
+        ret = -1;
+        goto fail;
+    }
+
+    if (mysql_query(s->conn, SQLquery_buf) != 0) {
+        fprintf(stderr, "Error %u: %s\n",
+                mysql_errno(s->conn),
+                mysql_error(s->conn));
+        ret = -1;
+        goto fail;
+    }
+
+    fprintf(stderr, "inblock_offset: %lld\n", inblock_offset);
+
+    ret = bdrv_co_readv(bs->file, (s->raw2_header_offset / 512) + sector_num, 
+                        nb_sectors, qiov);
+    
+fail:
+    g_free(cluster);
+    g_free(SQLquery_buf);
+    
+    return ret;
 }
 
 static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
@@ -280,7 +433,7 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
 
     /* g_free(s->sha1_buf); */
 
-    assert(s->raw2_sectors_offset != 0);
+    assert(s->raw2_header_offset != 0);
     
     /* if (s->appeared && !get_dirty(s, sector_num)) { */
     /*     set_dirty_bitmap(bs, sector_num, nb_sectors, 1); */
@@ -290,7 +443,7 @@ static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
     /* fprintf(stderr, "%s 0x%016llx -- 0x%016llx\n",  */
     /*         __FUNCTION__, sector_num, sector_num + nb_sectors); */
     
-    return bdrv_co_writev(bs->file, (s->raw2_sectors_offset / 512) + sector_num,
+    return bdrv_co_writev(bs->file, (s->raw2_header_offset / 512) + sector_num,
                           nb_sectors, qiov);
 }
 
@@ -393,7 +546,9 @@ static void raw2_close(BlockDriverState *bs)
 
     s->blocksize  = 0;
     s->total_size = 0;
-    s->raw2_sectors_offset = 0;
+    s->raw2_header_offset = 0;
+
+    mysql_close(s->conn);
 }
 
 static int coroutine_fn raw2_co_flush(BlockDriverState *bs)
@@ -532,6 +687,7 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
     uint64_t bitmap_size, sha1_buf_size;
     uint64_t sha1_count;
     int ret;
+    uuid_t uuid;
 
     /* Read out options */
     while (options && options->name) {
@@ -554,9 +710,12 @@ static int raw2_create(const char *filename, QEMUOptionParameter *options)
     memset(&header, 0, sizeof(header));
     header.magic           = cpu_to_be32(RAW2_MAGIC);
     header.version         = cpu_to_be32(RAW2_VERSION);
-    header.appeared         = cpu_to_be32(0x1);
+    header.appeared        = cpu_to_be32(0x1);
     header.total_size      = cpu_to_be64(size);
     header.blocksize       = cpu_to_be64(RAW2_BLOCK_SIZE);
+
+    uuid_generate(uuid);    
+    uuid_unparse(uuid, (char*)header.uuid_sign);
 
     /* prepare null buffer for checksum */   
     bitmap_size = (size >> BDRV_SECTOR_BITS) + 
