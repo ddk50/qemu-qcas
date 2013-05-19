@@ -1681,6 +1681,21 @@ EOF
 fi
 
 ##########################################
+# my_sql c-includes probe, used for raw2.c
+##########################################
+# my_sql c-library probe, used for raw2.c
+ght_libs="-lghthash"
+libs_softmmu="$ght_libs $libs_softmmu"
+libs_tools="$ght_libs $libs_tools"
+
+mysqllib_libs=`mysql_config --libs 2> /dev/null`
+libs_softmmu="$mysqllib_libs $libs_softmmu"
+libs_tools="$mysqllib_libs $libs_tools"
+
+mysqllib_cflag=`mysql_config --cflags 2> /dev/null`
+QEMU_CFLAGS="$QEMU_CFLAGS $mysqllib_cflag"
+
+##########################################
 # fnmatch() probe, used for ACL routines
 fnmatch="no"
 cat > $TMPC << EOF

@@ -291,6 +291,8 @@ static struct {
     { .driver = "virtio-serial",        .flag = &default_virtcon   },
 };
 
+extern char *g_disklogging_start_data_str;
+
 static void res_free(void)
 {
     if (boot_splash_filedata != NULL) {
@@ -2453,6 +2455,9 @@ int main(int argc, char **argv, char **envp)
                 break;
             case QEMU_OPTION_cdrom:
                 drive_add(IF_DEFAULT, 2, optarg, CDROM_OPTS);
+                break;
+            case QEMU_OPTION_dts:
+                g_disklogging_start_data_str = (char*)optarg;
                 break;
             case QEMU_OPTION_boot:
                 {

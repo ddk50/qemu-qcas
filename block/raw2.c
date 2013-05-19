@@ -3,12 +3,17 @@
 #include "qemu-common.h"
 #include "block_int.h"
 #include "module.h"
+#include "migration.h"
+#include "qemu-barrier.h"
+#include "qemu-thread.h"
 #endif
 
 #include "sha1.h"
+#include "datetime.h"
 
 #include <mysql.h>
 #include <uuid/uuid.h>
+#include <time.h>
 
 #define RAW2_MAGIC (('R' << 24) | ('A' << 16) | ('W' << 8) | '2')
 #define RAW2_VERSION 1
@@ -63,7 +68,12 @@ typedef struct QEMU_PACKED Raw2Header {
 
 #define HEADER_SIZE ((sizeof(Raw2Header) + 511) & ~511)
 
-typedef struct QEMU_PACKED BDRVRaw2State {
+typedef struct hashlog_entry {
+    hash_entry hash;
+    QLIST_ENTRY(hashlog_entry) next_in_flight;
+} hashlog_entry;
+
+typedef struct BDRVRaw2State {
     uint64_t total_size;           /* in bytes  */
     uint64_t blocksize;            /* in bytes  */
     uint64_t raw2_header_offset;  /* in bytes  */
@@ -75,22 +85,39 @@ typedef struct QEMU_PACKED BDRVRaw2State {
     time_t logging_time;
     MYSQL *conn;
     uint8_t uuid_sign[37];
+    QemuMutex lock;
+    volatile int ready_for_logging;
+    time_t log_start_date;
+    QLIST_HEAD(, hashlog_entry) blk_accesslog;
 } BDRVRaw2State;
+
+typedef struct db_value {
+    SHA1_CTX ctx;
+    hash_entry hash;
+} db_value;
 
 //const char *sql_server = "ol-observer";
 const char *sql_server = "localhost";
 const char *sql_user = "kazushi";
 const char *sql_password = "TheXYA";
 const char *sql_database = "dirichlet_cachemodel_20130417";
-const char *sql_table = "sha1set";
+const char *sql_table_1 = "diskrecords";
+const char *sql_table_2 = "recordtstamps";
 
 static uint32_t crc32_le(const void *buf, int len);
-static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
-                             int nb_sectors, int dirty);
 
+void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
+                      int nb_sectors, int dirty);
 int get_dirty(BDRVRaw2State *s, int64_t sector);
 void clear_dirtylog(BDRVRaw2State *s);
 int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen);
+void insert_blk_accesslog(BlockDriverState *bs,
+                          db_value *value);
+void release_all_accesslog_entry(BlockDriverState *bs);
+
+extern time_t g_disklogging_start_date;
+extern uint64_t g_disklogging_interval;
+int g_enable_disklogging = 1;
 
 int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen)
 {
@@ -111,54 +138,124 @@ err:
     return 0;
 }
 
-typedef struct db_value {
-    SHA1_CTX ctx;
-    uint8_t sha1_hash[20];
-} db_value;
+void insert_blk_accesslog(BlockDriverState *bs,
+                          db_value *value)
+{ 
+    BDRVRaw2State *s = bs->opaque;
+    hashlog_entry *e;
 
-static int format_sql_insert(char *sql_query, int n_pages, 
-                             const char *sql_database, uint8_t *cluster)
-{    
-    int i;
-    int ret;
-    char tmp_SQLquery[MAX_STR_LEN + 1];
-    char asciihash[MAX_STR_LEN + 1];
-    char *ret_str = sql_query;
-    db_value value;
-
-    snprintf(sql_query, MAX_STR_LEN, "INSERT INTO %s.%s(sha1) VALUES",                                                                                                                                      sql_database, sql_table);
-    
-    for (i = 0 ; i < n_pages ; i++) {
-        
-        SHA1Init(&value.ctx); {
-            SHA1Update(&value.ctx, cluster + (i * RAW2_BLOCK_SIZE), RAW2_BLOCK_SIZE);
-        }; SHA1Final(value.sha1_hash, &value.ctx);
-
-        ret = bin2ascii(value.sha1_hash, sizeof(value.sha1_hash), 
-                        asciihash, MAX_STR_LEN);
-        if (!ret) {
-            fprintf(stderr, "bin2ascii error\n");
-            ret = -1;
-            goto fail;
-        }
-
-        if (i == (n_pages - 1)) {
-          snprintf(tmp_SQLquery, MAX_STR_LEN, " ('%s')", asciihash);
-        } else {
-          snprintf(tmp_SQLquery, MAX_STR_LEN, " ('%s'),", asciihash);
-        }
-        strcat(ret_str, tmp_SQLquery);
+    if (!g_enable_disklogging) {
+        return;
     }
-
-    return 0;
     
-fail:
-    return ret;
+    e = g_malloc0(sizeof(hashlog_entry));
+    assert(e != NULL);
 
+    memcpy(&e->hash, &value->hash, sizeof(hash_entry));
+    QLIST_INSERT_HEAD(&s->blk_accesslog, e, next_in_flight);
+
+    s->log_start_date += g_disklogging_interval / 1000;    
 }
 
-static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
-                             int nb_sectors, int dirty)
+#define MAX_SQLQUERY_ALLOC_LEN (100 * 1024 * 1024)
+
+void release_all_accesslog_entry(BlockDriverState *bs)
+{    
+    BDRVRaw2State *s = bs->opaque;
+    hashlog_entry *e;
+    struct tm *t_st;
+    char datetime_str[MAX_STR_LEN + 1];
+    char asciihash[MAX_STR_LEN + 1];
+    char *SQLquery;
+    int ret;
+    
+    if (!__sync_lock_test_and_set(&s->ready_for_logging, 1)) {
+        return;
+    }
+
+    fprintf(stderr, "insert log list ... ");
+
+    t_st = localtime(&g_disklogging_start_date);
+
+    snprintf(datetime_str,
+             MAX_STR_LEN,
+             "%04d-%02d-%02dT%02d:%02d:%02d",
+             t_st->tm_year + 1900,
+             t_st->tm_mon + 1,
+             t_st->tm_mday,
+             t_st->tm_hour,
+             t_st->tm_min,
+             t_st->tm_sec);
+
+    SQLquery = g_malloc0(MAX_SQLQUERY_ALLOC_LEN + 1);
+    assert(SQLquery != NULL);
+
+    snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
+             "INSERT INTO %s.%s(uuid, sha1, created_at, updated_at) VALUES",
+             sql_database, sql_table_1);
+
+    qemu_mutex_lock(&s->lock); {
+        QLIST_FOREACH(e, &s->blk_accesslog, next_in_flight) {
+            
+            char tmp_SQLquery[MAX_STR_LEN + 1];
+            
+            ret = bin2ascii(e->hash.sha1_hash, sizeof(e->hash.sha1_hash), 
+                            asciihash, MAX_STR_LEN);
+            if (!ret) {
+                fprintf(stderr, "bin2ascii error\n");
+                ret = -1;
+                goto fail;            
+            }
+
+            snprintf(tmp_SQLquery, MAX_STR_LEN, 
+                     " ('%s', '%s', cast('%s' as datetime), cast('%s' as datetime)),",
+                     s->uuid_sign, asciihash, datetime_str, datetime_str);
+
+            strncat(SQLquery, tmp_SQLquery, MAX_SQLQUERY_ALLOC_LEN);
+            
+            QLIST_REMOVE(e, next_in_flight);
+            g_free(e);
+        }
+    }; qemu_mutex_unlock(&s->lock);
+
+    SQLquery[strlen(SQLquery) - 1] = '\0'; /* remove last semi-colon */
+    
+    if (mysql_query(s->conn, SQLquery) != 0) {
+        fprintf(stderr, "Error %u: %s\n",
+                mysql_errno(s->conn),
+                mysql_error(s->conn));
+        goto fail;
+    }    
+
+    snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
+             "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
+             "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
+             sql_database, sql_table_2,
+             s->uuid_sign, datetime_str, datetime_str);
+    
+    if (mysql_query(s->conn, SQLquery) != 0) {
+        fprintf(stderr, "Error %u: %s\n",
+                mysql_errno(s->conn),
+                mysql_error(s->conn));
+        goto fail;
+    }    
+
+    g_free(SQLquery);
+    g_disklogging_start_date += g_disklogging_interval / 1000;
+
+    fprintf(stderr, "Done\n");
+    
+    return;
+
+fail:
+    fprintf(stderr, "INSERT FAILED\n");
+    g_free(SQLquery);
+    g_disklogging_start_date += g_disklogging_interval / 1000;
+    return;
+}
+
+void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
+                      int nb_sectors, int dirty)
 {    
     BDRVRaw2State *s = bs->opaque;
     int64_t start, end;
@@ -253,6 +350,8 @@ static int raw2_open(BlockDriverState *bs, int flags)
     Raw2Header header;
     int ret = 0;
 
+    assert(s->ready_for_logging == 0);
+
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
         printf("bdrv_pread: failed: %d\n", ret);
@@ -332,7 +431,7 @@ static int raw2_open(BlockDriverState *bs, int flags)
 
     /* connect to mysql server */
     s->conn = mysql_init(NULL);
-    fprintf(stdout, "connecting database ...");
+    fprintf(stdout, "connecting database ... ");
     fflush(stdout);
     if (mysql_real_connect(s->conn, sql_server, sql_user, 
                            sql_password, sql_database,
@@ -343,6 +442,19 @@ static int raw2_open(BlockDriverState *bs, int flags)
         goto fail_3;
     }
     fprintf(stdout, "Done\n");
+
+    /* init datetime */
+    if (!g_disklogging_start_date) {
+        g_enable_disklogging = 0;
+    } else {
+        g_enable_disklogging = 1;
+    }
+
+    QLIST_INIT(&s->blk_accesslog);
+
+    /* init lock */
+    qemu_mutex_init(&s->lock);
+    __sync_fetch_and_add(&s->ready_for_logging, 1);    
     
     return 1;
     
@@ -359,27 +471,23 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
 {
     BDRVRaw2State *s = bs->opaque;
     uint64_t page_index;
-    uint64_t inblock_offset;
-    int n_pages;
+    int i, n_pages;
     int ret;
     uint8_t *cluster;
-    char *SQLquery_buf;
+    db_value value;
 
     assert(s->raw2_header_offset != 0);
 
     page_index     = SEC2BYTE(sector_num) / RAW2_BLOCK_SIZE;
-    inblock_offset = SEC2BYTE(sector_num) % RAW2_BLOCK_SIZE;
+//    inblock_offset = SEC2BYTE(sector_num) % RAW2_BLOCK_SIZE;
     n_pages        = ((SEC2BYTE(nb_sectors) + (RAW2_BLOCK_SIZE - 1)) 
                       & ~(RAW2_BLOCK_SIZE - 1)) / RAW2_BLOCK_SIZE;
     assert(n_pages >= 1);
 
-    fprintf(stderr, "nb_sectors: %d, pages: %d\n", nb_sectors, n_pages);
+//    fprintf(stderr, "nb_sectors: %d, pages: %d\n", nb_sectors, n_pages);
 
     cluster = g_malloc0(n_pages * RAW2_BLOCK_SIZE);
-    assert(cluster != NULL);
-    
-    SQLquery_buf = g_malloc0(4 * 1024 * 1024);
-    assert(SQLquery_buf != NULL);
+    assert(cluster != NULL);   
 
     ret = bdrv_pread(bs->file, s->raw2_header_offset + (page_index * RAW2_BLOCK_SIZE),
                      cluster, (n_pages * RAW2_BLOCK_SIZE));
@@ -389,30 +497,20 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
         goto fail;
     }
 
-    //    qemu_iovec_from_buffer(qiov, cluster + inblock_offset, 
-    //                           SEC2BYTE(nb_sectors));
-    ret = format_sql_insert(SQLquery_buf, n_pages, sql_database, cluster);
-    if (ret < 0) {
-        ret = -1;
-        goto fail;
-    }
-
-    if (mysql_query(s->conn, SQLquery_buf) != 0) {
-        fprintf(stderr, "Error %u: %s\n",
-                mysql_errno(s->conn),
-                mysql_error(s->conn));
-        ret = -1;
-        goto fail;
-    }
-
-    fprintf(stderr, "inblock_offset: %lld\n", inblock_offset);
-
+    qemu_mutex_lock(&s->lock); {
+        for (i = 0 ; i < n_pages ; i++) {
+            SHA1Init(&value.ctx); {
+                SHA1Update(&value.ctx, cluster + (i * RAW2_BLOCK_SIZE), RAW2_BLOCK_SIZE);
+            }; SHA1Final(value.hash.sha1_hash, &value.ctx);
+            insert_blk_accesslog(bs, &value);
+        }
+    }; qemu_mutex_unlock(&s->lock);
+    
     ret = bdrv_co_readv(bs->file, (s->raw2_header_offset / 512) + sector_num, 
                         nb_sectors, qiov);
     
 fail:
     g_free(cluster);
-    g_free(SQLquery_buf);
     
     return ret;
 }
@@ -420,29 +518,7 @@ fail:
 static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
                                       int nb_sectors, QEMUIOVector *qiov)
 {
-    BDRVRaw2State *s = bs->opaque;
-//    uint8_t sha1_hash[20];
-//    SHA1_CTX ctx;
-    
-    /* s->sha1_buf = g_malloc0(RAW2_BLOCK_SIZE); */
-    /* assert(s->sha1_buf); */
-    
-    /* SHA1Init(&ctx); */
-    /* SHA1Update(&ctx, s->sha1_buf, RAW2_BLOCK_SIZE); */
-    /* SHA1Final(sha1_hash, &ctx); */
-
-    /* g_free(s->sha1_buf); */
-
-    assert(s->raw2_header_offset != 0);
-    
-    /* if (s->appeared && !get_dirty(s, sector_num)) { */
-    /*     set_dirty_bitmap(bs, sector_num, nb_sectors, 1); */
-    /* } */
-    set_dirty_bitmap(bs, sector_num, nb_sectors, 1);
-    
-    /* fprintf(stderr, "%s 0x%016llx -- 0x%016llx\n",  */
-    /*         __FUNCTION__, sector_num, sector_num + nb_sectors); */
-    
+    BDRVRaw2State *s = bs->opaque;    
     return bdrv_co_writev(bs->file, (s->raw2_header_offset / 512) + sector_num,
                           nb_sectors, qiov);
 }
@@ -548,7 +624,7 @@ static void raw2_close(BlockDriverState *bs)
     s->total_size = 0;
     s->raw2_header_offset = 0;
 
-    mysql_close(s->conn);
+    mysql_close(s->conn);   
 }
 
 static int coroutine_fn raw2_co_flush(BlockDriverState *bs)
@@ -620,47 +696,21 @@ static void raw2_lock_medium(BlockDriverState *bs, bool locked)
 static int raw2_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
 {
     int ret;    
-    BDRVRaw2State *s = bs->opaque;
-    struct tm *tmp;
-    char logfname[255];
-    FILE *fp;
-    uint64_t i, n_page;
+//    BDRVRaw2State *s = bs->opaque;
+//    struct tm *tmp;
+//    uint64_t i, n_page;
 
     switch (req) {
     case 0x07214545:
-        
-        /* record dirty bits of disk and clear them */
-        fprintf(stderr, "****** output logging ******\n");
-        time(&s->logging_time);
-        tmp = localtime(&s->logging_time);
-        
-        snprintf(logfname, 255 - 1, "%d%02d%02d%02d%02d%02d.log",
-                 tmp->tm_year + 1900, tmp->tm_mon, tmp->tm_mday,
-                 tmp->tm_hour, tmp->tm_min, tmp->tm_sec);
-
-        n_page = s->sha1_buf_size / sizeof(hash_entry);
-
-        if ((fp = fopen(logfname, "w")) == NULL) {
-            ret = -1;
-            fprintf(stderr, "%s open log file error\n", logfname);
+        if (!g_enable_disklogging) {
             break;
         }
-
-        for (i = 0 ; i < n_page ; ++i) {
-            int r;
-            assert((i * RAW2_BLOCK_SIZE) % 512 == 0);
-            r = get_dirty(s, (i * RAW2_BLOCK_SIZE) / 512);
-            
-            putc(r ? '1' : '0', fp);
-            if ((i + 1) < n_page) {
-                putc(',', fp);
-            }
-        }
-
-        fclose(fp);
+        /* record dirty bits of disk and clear them */
+//        time(&s->logging_time);
+//        tmp = localtime(&s->logging_time);
         
-        clear_dirtylog(s);
-        
+//        n_page = s->sha1_buf_size / sizeof(hash_entry);        
+        release_all_accesslog_entry(bs);
         break;
     default:
         ret = -1;

@@ -31,6 +31,7 @@
 #include "qemu-coroutine.h"
 #include "qmp-commands.h"
 #include "qemu-timer.h"
+#include "datetime.h"
 
 #ifdef CONFIG_BSD
 #include <sys/types.h>
@@ -106,6 +107,11 @@ typedef struct DiskLoggingState {
 } DiskLoggingState;
 
 static DiskLoggingState dls;
+
+/* for disk analysis */
+char *g_disklogging_start_data_str = NULL;
+time_t g_disklogging_start_date = 0x0;
+const uint64_t g_disklogging_interval = 300000; /* 5 min */
 
 #ifdef _WIN32
 static int is_windows_drive_prefix(const char *filename)
@@ -855,12 +861,12 @@ void bdrv_close_all(void)
 {
     BlockDriverState *bs;
 
+    /* free for disk loggin timer handler */
+    qemu_free_timer(dls.dl_timer);
+
     QTAILQ_FOREACH(bs, &bdrv_states, list) {
         bdrv_close(bs);
     }
-
-    /* free for disk loggin timer handler */
-    qemu_free_timer(dls.dl_timer);
 }
 
 /*
@@ -3289,14 +3295,14 @@ BlockDriverAIOCB *bdrv_aio_discard(BlockDriverState *bs,
 
 static void bdrv_disklog_update(void *opaque)
 {
-    uint64_t interval = 1000; /* 1 sec ? */
+    uint64_t interval = g_disklogging_interval;
     BlockDriverState *bs;
     DiskLoggingState *dls = (DiskLoggingState*)opaque;
     
     qemu_mod_timer(dls->dl_timer, interval + qemu_get_clock_ms(rt_clock));
 
     QTAILQ_FOREACH(bs, &bdrv_states, list) {        
-        /* record dirty bits of disk and clear them */        
+        /* record dirty bits of disk and clear them */
         bdrv_ioctl(bs, 0x07214545, NULL);
     }
 }
@@ -3308,12 +3314,59 @@ void bdrv_init(void)
 
 void bdrv_init_with_whitelist(void)
 {
+    char datetime_str[256];
+    int use_time = 0;
+    struct tm *t_st;
+    int ret;
+    
     use_bdrv_whitelist = 1;    
     bdrv_init();
     
     /* initialize disk logging timer handler */
     dls.dl_timer = qemu_new_timer_ms(rt_clock, bdrv_disklog_update, &dls);
     qemu_mod_timer(dls.dl_timer, qemu_get_clock_ms(rt_clock));
+
+    /* init datetime */
+    if (g_disklogging_start_data_str == NULL) { 
+        fprintf(stderr, "-datetime is not spacified.\n");
+        use_time = 1;
+    } else {
+        if (parse_datetime(g_disklogging_start_data_str,
+                           &g_disklogging_start_date)) { 
+            /* ok */
+        } else {
+            use_time = 1;
+            fprintf(stderr, "timestamp is not valid format.\n");            
+        }
+    }
+
+    if (use_time) {          
+        time_t timer;
+        
+        time(&timer);
+        t_st = localtime(&timer);
+        
+        snprintf(datetime_str,
+                 255,
+                 "%04d-%02d-%02d %02d:%02d:%02d",
+                 t_st->tm_year + 1900,
+                 t_st->tm_mon + 1,
+                 t_st->tm_mday,
+                 t_st->tm_hour,
+                 t_st->tm_min,
+                 t_st->tm_sec);
+        
+        fprintf(stderr, 
+                " %s is used as disk timestamp for logging\n",
+                datetime_str);
+
+        ret = parse_datetime(datetime_str, &g_disklogging_start_date);
+        assert(ret == 1);
+    }
+
+    fprintf(stderr, "g_disklogging_start_date: %lld\n", 
+            (uint64_t)g_disklogging_start_date);
+
 }
 
 void *qemu_aio_get(AIOPool *pool, BlockDriverState *bs,

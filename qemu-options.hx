@@ -133,6 +133,15 @@ Use @var{file} as CD-ROM image (you cannot use @option{-hdc} and
 using @file{/dev/cdrom} as filename (@pxref{host_drives}).
 ETEXI
 
+DEF("datetime", HAS_ARG, QEMU_OPTION_dts,
+    "-datetime datetime     use 'datetime' as timestamps for diskimages to read analysis (e.g. '2013-04-09 12:03:30')\n",
+    QEMU_ARCH_ALL)
+STEXI
+@item -datetime @var{datetime}
+@findex -datetime
+Use @var{datetime} as timestamps for diskimages to read analysis.
+ETEXI
+
 DEF("drive", HAS_ARG, QEMU_OPTION_drive,
     "-drive [file=file][,if=type][,bus=n][,unit=m][,media=d][,index=i]\n"
     "       [,cyls=c,heads=h,secs=s[,trans=t]][,snapshot=on|off]\n"
