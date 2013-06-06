@@ -70,7 +70,7 @@ typedef struct QEMU_PACKED Raw2Header {
 
 typedef struct hashlog_entry {
     hash_entry hash;
-    QLIST_ENTRY(hashlog_entry) next_in_flight;
+    QLIST_ENTRY(hashlog_entry) next;
 } hashlog_entry;
 
 typedef struct BDRVRaw2State {
@@ -88,7 +88,7 @@ typedef struct BDRVRaw2State {
     QemuMutex lock;
     volatile int ready_for_logging;
     time_t log_start_date;
-    QLIST_HEAD(, hashlog_entry) blk_accesslog;
+    QLIST_HEAD(blk_accesslog, hashlog_entry) blk_accesslog;
 } BDRVRaw2State;
 
 typedef struct db_value {
@@ -97,12 +97,11 @@ typedef struct db_value {
 } db_value;
 
 //const char *sql_server = "ol-observer";
-const char *sql_server = "localhost";
-const char *sql_user = "kazushi";
-const char *sql_password = "TheXYA";
-const char *sql_database = "dirichlet_cachemodel_20130417";
-const char *sql_table_1 = "diskrecords";
-const char *sql_table_2 = "recordtstamps";
+const char *db_server = "localhost";
+const char *db_user = "kazushi";
+const char *db_password = "TheXYA";
+const char *db_disklog_records = "diskrecords";
+const char *db_expertime_records = "recordtstamps";
 
 static uint32_t crc32_le(const void *buf, int len);
 
@@ -114,10 +113,27 @@ int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen);
 void insert_blk_accesslog(BlockDriverState *bs,
                           db_value *value);
 void release_all_accesslog_entry(BlockDriverState *bs);
+uint64_t get_list_size(BlockDriverState *bs);
 
+extern int g_enable_danalysis;
 extern time_t g_disklogging_start_date;
 extern uint64_t g_disklogging_interval;
-int g_enable_disklogging = 1;
+extern char *db_database;
+
+uint64_t get_list_size(BlockDriverState *bs)
+{
+    BDRVRaw2State *s = bs->opaque;
+    hashlog_entry *e;
+    uint64_t val = 0;
+
+    qemu_mutex_lock(&s->lock); {
+        QLIST_FOREACH(e, &s->blk_accesslog, next) {
+            val++;
+        }
+    }; qemu_mutex_unlock(&s->lock);    
+
+    return val;
+}
 
 int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen)
 {
@@ -144,7 +160,7 @@ void insert_blk_accesslog(BlockDriverState *bs,
     BDRVRaw2State *s = bs->opaque;
     hashlog_entry *e;
 
-    if (!g_enable_disklogging) {
+    if (!g_enable_danalysis) {
         return;
     }
     
@@ -152,9 +168,9 @@ void insert_blk_accesslog(BlockDriverState *bs,
     assert(e != NULL);
 
     memcpy(&e->hash, &value->hash, sizeof(hash_entry));
-    QLIST_INSERT_HEAD(&s->blk_accesslog, e, next_in_flight);
+    QLIST_INSERT_HEAD(&s->blk_accesslog, e, next);
 
-    s->log_start_date += g_disklogging_interval / 1000;    
+    s->log_start_date += g_disklogging_interval / 1000;
 }
 
 #define MAX_SQLQUERY_ALLOC_LEN (100 * 1024 * 1024)
@@ -168,6 +184,7 @@ void release_all_accesslog_entry(BlockDriverState *bs)
     char asciihash[MAX_STR_LEN + 1];
     char *SQLquery;
     int ret;
+    uint64_t count = 0;
     
     if (!__sync_lock_test_and_set(&s->ready_for_logging, 1)) {
         return;
@@ -192,11 +209,10 @@ void release_all_accesslog_entry(BlockDriverState *bs)
 
     snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
              "INSERT INTO %s.%s(uuid, sha1, created_at, updated_at) VALUES",
-             sql_database, sql_table_1);
+             db_database, db_disklog_records);   
 
     qemu_mutex_lock(&s->lock); {
-        QLIST_FOREACH(e, &s->blk_accesslog, next_in_flight) {
-            
+        QLIST_FOREACH(e, &s->blk_accesslog, next) {
             char tmp_SQLquery[MAX_STR_LEN + 1];
             
             ret = bin2ascii(e->hash.sha1_hash, sizeof(e->hash.sha1_hash), 
@@ -204,7 +220,7 @@ void release_all_accesslog_entry(BlockDriverState *bs)
             if (!ret) {
                 fprintf(stderr, "bin2ascii error\n");
                 ret = -1;
-                goto fail;            
+                goto fail;
             }
 
             snprintf(tmp_SQLquery, MAX_STR_LEN, 
@@ -213,8 +229,10 @@ void release_all_accesslog_entry(BlockDriverState *bs)
 
             strncat(SQLquery, tmp_SQLquery, MAX_SQLQUERY_ALLOC_LEN);
             
-            QLIST_REMOVE(e, next_in_flight);
+            QLIST_REMOVE(e, next);
             g_free(e);
+
+            count++;
         }
     }; qemu_mutex_unlock(&s->lock);
 
@@ -225,12 +243,12 @@ void release_all_accesslog_entry(BlockDriverState *bs)
                 mysql_errno(s->conn),
                 mysql_error(s->conn));
         goto fail;
-    }    
+    }
 
     snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
              "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
              "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
-             sql_database, sql_table_2,
+             db_database, db_expertime_records,
              s->uuid_sign, datetime_str, datetime_str);
     
     if (mysql_query(s->conn, SQLquery) != 0) {
@@ -243,7 +261,7 @@ void release_all_accesslog_entry(BlockDriverState *bs)
     g_free(SQLquery);
     g_disklogging_start_date += g_disklogging_interval / 1000;
 
-    fprintf(stderr, "Done\n");
+    fprintf(stderr, "Done (%lld inserted)\n", count);
     
     return;
 
@@ -429,32 +447,39 @@ static int raw2_open(BlockDriverState *bs, int flags)
     //    bs->sg = bs->file->sg;
     bs->total_sectors = s->total_size / 512;
 
-    /* connect to mysql server */
-    s->conn = mysql_init(NULL);
-    fprintf(stdout, "connecting database ... ");
-    fflush(stdout);
-    if (mysql_real_connect(s->conn, sql_server, sql_user, 
-                           sql_password, sql_database,
-                           0, NULL, 0) == NULL) {
-        fprintf(stderr, "Cloud not connect to database %u: %s\n",
-                mysql_errno(s->conn), mysql_error(s->conn));
-        ret = -1;
-        goto fail_3;
-    }
-    fprintf(stdout, "Done\n");
+    if (g_enable_danalysis) {
+        if (!g_disklogging_start_date) {
+            g_enable_danalysis = 0;
+        } else {
+            g_enable_danalysis = 1;
+        }
+    };
 
-    /* init datetime */
-    if (!g_disklogging_start_date) {
-        g_enable_disklogging = 0;
+    if (g_enable_danalysis) {
+        fprintf(stderr, "Disk logging is enabled\n");
+
+        /* connect to mysql server */
+        s->conn = mysql_init(NULL);
+        fprintf(stdout, "connecting database ... ");
+        fflush(stdout);
+        if (mysql_real_connect(s->conn, db_server,db_user, 
+                               db_password, db_database,
+                               0, NULL, 0) == NULL) {
+            fprintf(stderr, "Cloud not connect to database %u: %s\n",
+                    mysql_errno(s->conn), mysql_error(s->conn));
+            ret = -1;
+            goto fail_3;
+        }        
+        fprintf(stdout, "Done\n");
     } else {
-        g_enable_disklogging = 1;
+        fprintf(stderr, "Disk logging is disabled\n");
     }
-
+    
     QLIST_INIT(&s->blk_accesslog);
 
     /* init lock */
     qemu_mutex_init(&s->lock);
-    __sync_fetch_and_add(&s->ready_for_logging, 1);    
+    __sync_fetch_and_add(&s->ready_for_logging, 1);
     
     return 1;
     
@@ -505,6 +530,8 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
             insert_blk_accesslog(bs, &value);
         }
     }; qemu_mutex_unlock(&s->lock);
+
+//    fprintf(stderr, "get_list_size: %lld\n", get_list_size(bs));
     
     ret = bdrv_co_readv(bs->file, (s->raw2_header_offset / 512) + sector_num, 
                         nb_sectors, qiov);
@@ -518,7 +545,7 @@ fail:
 static int coroutine_fn raw2_co_writev(BlockDriverState *bs, int64_t sector_num,
                                       int nb_sectors, QEMUIOVector *qiov)
 {
-    BDRVRaw2State *s = bs->opaque;    
+    BDRVRaw2State *s = bs->opaque;
     return bdrv_co_writev(bs->file, (s->raw2_header_offset / 512) + sector_num,
                           nb_sectors, qiov);
 }
@@ -702,14 +729,14 @@ static int raw2_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
 
     switch (req) {
     case 0x07214545:
-        if (!g_enable_disklogging) {
+        if (!g_enable_danalysis) {
             break;
         }
         /* record dirty bits of disk and clear them */
 //        time(&s->logging_time);
 //        tmp = localtime(&s->logging_time);
         
-//        n_page = s->sha1_buf_size / sizeof(hash_entry);        
+//        n_page = s->sha1_buf_size / sizeof(hash_entry);
         release_all_accesslog_entry(bs);
         break;
     default:

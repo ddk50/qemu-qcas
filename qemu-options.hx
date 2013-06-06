@@ -142,6 +142,33 @@ STEXI
 Use @var{datetime} as timestamps for diskimages to read analysis.
 ETEXI
 
+DEF("enablediskanalysis", HAS_ARG, QEMU_OPTION_diskanalysis,
+    "-enablediskanalysis flag     use 'flag' to enable disk logging for analysis 1 or 0\n",
+    QEMU_ARCH_ALL)
+STEXI
+@item -enablediskanalysis @var{flag}
+@findex -enablediskanalysis
+Use @var{flag} to enable disk logging for analysis.
+ETEXI
+
+DEF("dlogginginterval", HAS_ARG, QEMU_OPTION_dlogginginterval,
+    "-dlogginginterval interval     use 'interval' as interval time for disk logging\n",
+    QEMU_ARCH_ALL)
+STEXI
+@item -dlogginginterval @var{interval}
+@findex -dlogginginterval
+Use @var{interval} as interval time for disk logging.
+ETEXI
+
+DEF("diskanalysisdb", HAS_ARG, QEMU_OPTION_diskanalysisdb,
+    "-diskanalysisdb dbname     use 'dbname' as database for disk logging\n",
+    QEMU_ARCH_ALL)
+STEXI
+@item -diskanalysisdb @var{dbname}
+@findex -diskanalysisdb
+Use @var{dbname} as database for disk logging.
+ETEXI
+
 DEF("drive", HAS_ARG, QEMU_OPTION_drive,
     "-drive [file=file][,if=type][,bus=n][,unit=m][,media=d][,index=i]\n"
     "       [,cyls=c,heads=h,secs=s[,trans=t]][,snapshot=on|off]\n"

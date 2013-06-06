@@ -111,7 +111,9 @@ static DiskLoggingState dls;
 /* for disk analysis */
 char *g_disklogging_start_data_str = NULL;
 time_t g_disklogging_start_date = 0x0;
-const uint64_t g_disklogging_interval = 300000; /* 5 min */
+int g_enable_danalysis = 0;
+uint64_t g_disklogging_interval = 300000; /* 5 min */
+char *db_database = NULL;
 
 #ifdef _WIN32
 static int is_windows_drive_prefix(const char *filename)
@@ -3320,53 +3322,53 @@ void bdrv_init_with_whitelist(void)
     int ret;
     
     use_bdrv_whitelist = 1;    
-    bdrv_init();
-    
-    /* initialize disk logging timer handler */
-    dls.dl_timer = qemu_new_timer_ms(rt_clock, bdrv_disklog_update, &dls);
-    qemu_mod_timer(dls.dl_timer, qemu_get_clock_ms(rt_clock));
+    bdrv_init();   
 
-    /* init datetime */
-    if (g_disklogging_start_data_str == NULL) { 
-        fprintf(stderr, "-datetime is not spacified.\n");
-        use_time = 1;
-    } else {
-        if (parse_datetime(g_disklogging_start_data_str,
-                           &g_disklogging_start_date)) { 
-            /* ok */
-        } else {
+    if (g_enable_danalysis) {
+        /* init datetime */
+        if (g_disklogging_start_data_str == NULL) { 
+            fprintf(stderr, "-datetime is not spacified.\n");
             use_time = 1;
-            fprintf(stderr, "timestamp is not valid format.\n");            
+        } else {
+            if (parse_datetime(g_disklogging_start_data_str,
+                               &g_disklogging_start_date)) { 
+                /* ok */
+            } else {
+                use_time = 1;
+                fprintf(stderr, "timestamp is not valid format.\n");  
+            }
         }
+
+        if (use_time) {          
+            time_t timer;
+        
+            time(&timer);
+            t_st = localtime(&timer);
+        
+            snprintf(datetime_str,
+                     255,
+                     "%04d-%02d-%02d %02d:%02d:%02d",
+                     t_st->tm_year + 1900,
+                     t_st->tm_mon + 1,
+                     t_st->tm_mday,
+                     t_st->tm_hour,
+                     t_st->tm_min,
+                     t_st->tm_sec);
+        
+            fprintf(stderr, 
+                    " %s is used as disk timestamp for logging\n",
+                    datetime_str);
+
+            ret = parse_datetime(datetime_str, &g_disklogging_start_date);
+            assert(ret == 1);
+        }
+
+        fprintf(stderr, "interval: %llu\n", g_disklogging_interval);
+
+        /* initialize disk logging timer handler */
+        dls.dl_timer = qemu_new_timer_ms(rt_clock, bdrv_disklog_update, &dls);
+        qemu_mod_timer(dls.dl_timer, g_disklogging_interval + qemu_get_clock_ms(rt_clock));
     }
-
-    if (use_time) {          
-        time_t timer;
-        
-        time(&timer);
-        t_st = localtime(&timer);
-        
-        snprintf(datetime_str,
-                 255,
-                 "%04d-%02d-%02d %02d:%02d:%02d",
-                 t_st->tm_year + 1900,
-                 t_st->tm_mon + 1,
-                 t_st->tm_mday,
-                 t_st->tm_hour,
-                 t_st->tm_min,
-                 t_st->tm_sec);
-        
-        fprintf(stderr, 
-                " %s is used as disk timestamp for logging\n",
-                datetime_str);
-
-        ret = parse_datetime(datetime_str, &g_disklogging_start_date);
-        assert(ret == 1);
-    }
-
-    fprintf(stderr, "g_disklogging_start_date: %lld\n", 
-            (uint64_t)g_disklogging_start_date);
-
 }
 
 void *qemu_aio_get(AIOPool *pool, BlockDriverState *bs,

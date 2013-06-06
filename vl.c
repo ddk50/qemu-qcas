@@ -291,7 +291,11 @@ static struct {
     { .driver = "virtio-serial",        .flag = &default_virtcon   },
 };
 
+/* for raw2.c */
+extern int g_enable_danalysis;
+extern uint64_t g_disklogging_interval;
 extern char *g_disklogging_start_data_str;
+extern char *db_database;
 
 static void res_free(void)
 {
@@ -2457,7 +2461,24 @@ int main(int argc, char **argv, char **envp)
                 drive_add(IF_DEFAULT, 2, optarg, CDROM_OPTS);
                 break;
             case QEMU_OPTION_dts:
+                /* for raw2.c */
                 g_disklogging_start_data_str = (char*)optarg;
+                break;
+            case QEMU_OPTION_diskanalysis:
+                {
+                    int val = strtol(optarg, (char **) &optarg, 10);
+                    g_enable_danalysis = val ? 1 : 0;
+                }
+                break;
+            case QEMU_OPTION_dlogginginterval:
+                {
+                    uint64_t val = strtol(optarg, (char **) &optarg, 10);
+                    g_disklogging_interval = val;
+                    fprintf(stderr, "interval: %llu\n", g_disklogging_interval);
+                }
+                break;
+            case QEMU_OPTION_diskanalysisdb:
+                db_database = (char*)optarg;
                 break;
             case QEMU_OPTION_boot:
                 {
