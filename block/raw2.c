@@ -10,6 +10,7 @@
 
 #include "sha1.h"
 #include "datetime.h"
+#include "bench.h"
 
 #include <mysql.h>
 #include <uuid/uuid.h>
@@ -46,6 +47,26 @@
 #endif
 
 #define MAX_STR_LEN 255
+
+#define START_TRANSACTION(x)                                    \
+    do {                                                        \
+        if (mysql_query((x)->conn, "START TRANSACTION") != 0) { \
+            fprintf(stderr, "Error %u: %s\n",                   \
+                    mysql_errno((x)->conn),                     \
+                    mysql_error((x)->conn));                    \
+            fprintf(stderr, "start transcation error\n");       \
+        }                                                       \
+    } while (0);
+
+#define COMMIT(x)                                           \
+    do {                                                    \
+        if (mysql_query((x)->conn, "COMMIT") != 0) {        \
+            fprintf(stderr, "Error %u: %s\n",               \
+                    mysql_errno((x)->conn),                 \
+                    mysql_error((x)->conn));                \
+            fprintf(stderr, "start transcation error\n");   \
+        }                                                   \
+    } while (0);
 
 typedef struct QEMU_PACKED hash_entry {
     uint8_t sha1_hash[20];
@@ -88,6 +109,7 @@ typedef struct BDRVRaw2State {
     QemuMutex lock;
     volatile int ready_for_logging;
     time_t log_start_date;
+    int accesslog_entry_count;
     QLIST_HEAD(blk_accesslog, hashlog_entry) blk_accesslog;
 } BDRVRaw2State;
 
@@ -104,14 +126,18 @@ const char *db_disklog_records = "diskrecords";
 const char *db_expertime_records = "recordtstamps";
 
 static uint32_t crc32_le(const void *buf, int len);
+static int get_total_SQLquery_len(int *SQLlen, int n_pages, 
+                                  const char *db_name, 
+                                  const char *db_tbl_name);
 
+char *fast_strncat(char *dest, const char *src, size_t n, size_t *pos);
 void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
                       int nb_sectors, int dirty);
 int get_dirty(BDRVRaw2State *s, int64_t sector);
 void clear_dirtylog(BDRVRaw2State *s);
 int bin2ascii(const void *buf, int buf_len, char *ostr, int max_slen);
-void insert_blk_accesslog(BlockDriverState *bs,
-                          db_value *value);
+void insert_blk_accesslog_unsafe(BlockDriverState *bs,
+                                 db_value *value);
 void release_all_accesslog_entry(BlockDriverState *bs);
 uint64_t get_list_size(BlockDriverState *bs);
 
@@ -154,8 +180,8 @@ err:
     return 0;
 }
 
-void insert_blk_accesslog(BlockDriverState *bs,
-                          db_value *value)
+void insert_blk_accesslog_unsafe(BlockDriverState *bs,
+                                 db_value *value)
 { 
     BDRVRaw2State *s = bs->opaque;
     hashlog_entry *e;
@@ -171,29 +197,31 @@ void insert_blk_accesslog(BlockDriverState *bs,
     QLIST_INSERT_HEAD(&s->blk_accesslog, e, next);
 
     s->log_start_date += g_disklogging_interval / 1000;
+    s->accesslog_entry_count++;
 }
 
-#define MAX_SQLQUERY_ALLOC_LEN (100 * 1024 * 1024)
-
-void release_all_accesslog_entry(BlockDriverState *bs)
-{    
-    BDRVRaw2State *s = bs->opaque;
-    hashlog_entry *e;
+static int get_total_SQLquery_len(int *SQLlen, int n_pages, 
+                                  const char *db_name, const char *db_tbl_name)
+{
+    char SQLquery[MAX_STR_LEN + 1] = {0};
+    char hash_ascii[MAX_STR_LEN + 1] = {0};
+    char datetime_str[MAX_STR_LEN + 1] = {0};
+    unsigned char hash[20] = {0};
+    uint8_t uuid_sign[37];
+    uuid_t uuid;
+    time_t now;
     struct tm *t_st;
-    char datetime_str[MAX_STR_LEN + 1];
-    char asciihash[MAX_STR_LEN + 1];
-    char *SQLquery;
-    int ret;
-    uint64_t count = 0;
+    int len = 0;
+    int n = n_pages;
     
-    if (!__sync_lock_test_and_set(&s->ready_for_logging, 1)) {
-        return;
-    }
+    snprintf(SQLquery, MAX_STR_LEN,
+             "INSERT INTO %s.%s(uuid, sha1, created_at, updated_at) VALUES",
+             db_name, db_tbl_name);
 
-    fprintf(stderr, "insert log list ... ");
+    len += strlen(SQLquery);
 
-    t_st = localtime(&g_disklogging_start_date);
-
+    time(&now);
+    t_st = localtime(&now);
     snprintf(datetime_str,
              MAX_STR_LEN,
              "%04d-%02d-%02dT%02d:%02d:%02d",
@@ -204,16 +232,75 @@ void release_all_accesslog_entry(BlockDriverState *bs)
              t_st->tm_min,
              t_st->tm_sec);
 
-    SQLquery = g_malloc0(MAX_SQLQUERY_ALLOC_LEN + 1);
-    assert(SQLquery != NULL);
+    if (!bin2ascii(&hash, sizeof(hash), hash_ascii, MAX_STR_LEN)) {
+        return 0;
+    }
 
-    snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
-             "INSERT INTO %s.%s(uuid, sha1, created_at, updated_at) VALUES",
-             db_database, db_disklog_records);   
+    uuid_generate(uuid);
+    uuid_unparse(uuid, (char*)uuid_sign);
+
+    snprintf(SQLquery, MAX_STR_LEN, 
+             " ('%s', '%s', cast('%s' as datetime), cast('%s' as datetime)),",
+             uuid_sign, hash_ascii, datetime_str, datetime_str);
+
+    len += (strlen(SQLquery) * n) + 1;
+    *SQLlen = len;
+
+    return 1;
+}
+
+void release_all_accesslog_entry(BlockDriverState *bs)
+{    
+    BDRVRaw2State *s = bs->opaque;
+    hashlog_entry *e;
+    struct tm *t_st;
+    char datetime_str[MAX_STR_LEN + 1];
+    char asciihash[MAX_STR_LEN + 1];
+    char tmp_SQLquery[MAX_STR_LEN + 1];
+    char *SQLquery;
+    int ret;
+    double start;
+    int SQLlen;
+    size_t str_epos = 0;
+    
+    if (!__sync_lock_test_and_set(&s->ready_for_logging, 1)) {
+        return;
+    }
+
+    fprintf(stderr, "insert log list ... ");
+
+    t_st = localtime(&g_disklogging_start_date);
+    snprintf(datetime_str,
+             MAX_STR_LEN,
+             "%04d-%02d-%02dT%02d:%02d:%02d",
+             t_st->tm_year + 1900,
+             t_st->tm_mon + 1,
+             t_st->tm_mday,
+             t_st->tm_hour,
+             t_st->tm_min,
+             t_st->tm_sec);
+
+    settimer(&start);
 
     qemu_mutex_lock(&s->lock); {
+
+        if (!get_total_SQLquery_len(&SQLlen, s->accesslog_entry_count,
+                                    db_database, db_disklog_records)) {
+            fprintf(stderr, "error get_total_SQLquery_len error\n");
+            ret = -1;
+            goto fail_nofree;
+        }
+        
+        SQLquery = g_malloc0(SQLlen);
+        assert(SQLquery != NULL);
+
+        snprintf(SQLquery, SQLlen, 
+                 "INSERT INTO %s.%s(uuid, sha1, created_at, updated_at) VALUES",
+                 db_database, db_disklog_records);
+
+        str_epos = strlen(SQLquery);
+
         QLIST_FOREACH(e, &s->blk_accesslog, next) {
-            char tmp_SQLquery[MAX_STR_LEN + 1];
             
             ret = bin2ascii(e->hash.sha1_hash, sizeof(e->hash.sha1_hash), 
                             asciihash, MAX_STR_LEN);
@@ -226,49 +313,56 @@ void release_all_accesslog_entry(BlockDriverState *bs)
             snprintf(tmp_SQLquery, MAX_STR_LEN, 
                      " ('%s', '%s', cast('%s' as datetime), cast('%s' as datetime)),",
                      s->uuid_sign, asciihash, datetime_str, datetime_str);
-
-            strncat(SQLquery, tmp_SQLquery, MAX_SQLQUERY_ALLOC_LEN);
+            
+            fast_strncat(SQLquery, tmp_SQLquery, MAX_STR_LEN, &str_epos);
             
             QLIST_REMOVE(e, next);
             g_free(e);
-
-            count++;
         }
+
+        SQLquery[str_epos - 1] = '\0'; /* remove last semi-colon */
+    
+        START_TRANSACTION(s) {
+            if (mysql_query(s->conn, SQLquery) != 0) {
+                fprintf(stderr, "Error %u: %s\n",
+                        mysql_errno(s->conn),
+                        mysql_error(s->conn));
+                goto fail;
+            }
+        } COMMIT(s);
+
+        snprintf(SQLquery, SQLlen, 
+                 "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
+                 "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
+                 db_database, db_expertime_records,
+                 s->uuid_sign, datetime_str, datetime_str);
+
+        START_TRANSACTION(s) {
+            if (mysql_query(s->conn, SQLquery) != 0) {
+                fprintf(stderr, "Error %u: %s\n",
+                        mysql_errno(s->conn),
+                        mysql_error(s->conn));
+                goto fail;
+            }
+        } COMMIT(s);
+        
+        s->accesslog_entry_count = 0;
     }; qemu_mutex_unlock(&s->lock);
 
-    SQLquery[strlen(SQLquery) - 1] = '\0'; /* remove last semi-colon */
-    
-    if (mysql_query(s->conn, SQLquery) != 0) {
-        fprintf(stderr, "Error %u: %s\n",
-                mysql_errno(s->conn),
-                mysql_error(s->conn));
-        goto fail;
-    }
-
-    snprintf(SQLquery, MAX_SQLQUERY_ALLOC_LEN, 
-             "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
-             "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
-             db_database, db_expertime_records,
-             s->uuid_sign, datetime_str, datetime_str);
-    
-    if (mysql_query(s->conn, SQLquery) != 0) {
-        fprintf(stderr, "Error %u: %s\n",
-                mysql_errno(s->conn),
-                mysql_error(s->conn));
-        goto fail;
-    }    
-
     g_free(SQLquery);
-    g_disklogging_start_date += g_disklogging_interval / 1000;
+    g_disklogging_start_date += g_disklogging_interval / 1000;   
 
-    fprintf(stderr, "Done (%lld inserted)\n", count);
+    fprintf(stderr, "Done (%d inserted, %lf sec consumed)\n", 
+            s->accesslog_entry_count, stoptimer(start));
     
     return;
 
 fail:
-    fprintf(stderr, "INSERT FAILED\n");
     g_free(SQLquery);
+fail_nofree:
+    qemu_mutex_unlock(&s->lock);
     g_disklogging_start_date += g_disklogging_interval / 1000;
+    fprintf(stderr, "INSERTION FAILED\n");
     return;
 }
 
@@ -315,6 +409,22 @@ int get_dirty(BDRVRaw2State *s, int64_t sector)
 void clear_dirtylog(BDRVRaw2State *s)
 {
     memset((uint8_t*)s->bitmap, 0, s->bitmap_size);
+}
+
+char *fast_strncat(char *dest, const char *src,
+                   size_t n, size_t *pos)
+{    
+    size_t dest_len = *pos;
+    size_t i;
+
+    for (i = 0 ; i < n && src[i] != '\0' ; i++) {
+        dest[dest_len + i] = src[i];
+    }
+    
+    dest[dest_len + i] = '\0';
+    *pos = dest_len + i;
+
+    return dest;
 }
 
 static uint32_t crc32_le(const void *buf, int len)
@@ -469,13 +579,23 @@ static int raw2_open(BlockDriverState *bs, int flags)
                     mysql_errno(s->conn), mysql_error(s->conn));
             ret = -1;
             goto fail_3;
-        }        
+        }
+
+        /* auto commit off */
+        if (mysql_autocommit(s->conn, 0) != 0) {
+            fprintf(stderr, "Cloud not disable autocommit mode %u: %s\n",
+                    mysql_errno(s->conn), mysql_error(s->conn));
+            ret = -1;
+            goto fail_3;            
+        }
+
         fprintf(stdout, "Done\n");
     } else {
         fprintf(stderr, "Disk logging is disabled\n");
     }
     
     QLIST_INIT(&s->blk_accesslog);
+    s->accesslog_entry_count = 0;
 
     /* init lock */
     qemu_mutex_init(&s->lock);
@@ -527,7 +647,7 @@ static int coroutine_fn raw2_co_readv(BlockDriverState *bs, int64_t sector_num,
             SHA1Init(&value.ctx); {
                 SHA1Update(&value.ctx, cluster + (i * RAW2_BLOCK_SIZE), RAW2_BLOCK_SIZE);
             }; SHA1Final(value.hash.sha1_hash, &value.ctx);
-            insert_blk_accesslog(bs, &value);
+            insert_blk_accesslog_unsafe(bs, &value);
         }
     }; qemu_mutex_unlock(&s->lock);
 
