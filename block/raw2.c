@@ -58,14 +58,24 @@
         }                                                       \
     } while (0);
 
-#define COMMIT(x)                                           \
-    do {                                                    \
-        if (mysql_query((x)->conn, "COMMIT") != 0) {        \
-            fprintf(stderr, "Error %u: %s\n",               \
-                    mysql_errno((x)->conn),                 \
-                    mysql_error((x)->conn));                \
-            fprintf(stderr, "start transcation error\n");   \
-        }                                                   \
+#define COMMIT(x)                                       \
+    do {                                                \
+        if (mysql_query((x)->conn, "COMMIT") != 0) {    \
+            fprintf(stderr, "Error %u: %s\n",           \
+                    mysql_errno((x)->conn),             \
+                    mysql_error((x)->conn));            \
+            fprintf(stderr, "commit error\n");          \
+        }                                               \
+    } while (0);
+
+#define ROLLBACK(x)                                     \
+    do {                                                \
+        if (mysql_query((x)->conn, "ROLLBACK") != 0) {  \
+            fprintf(stderr, "Error %u: %s\n",           \
+                    mysql_errno((x)->conn),             \
+                    mysql_error((x)->conn));            \
+            fprintf(stderr, "rollback error\n");        \
+        }                                               \
     } while (0);
 
 typedef struct QEMU_PACKED hash_entry {
@@ -327,22 +337,20 @@ void release_all_accesslog_entry(BlockDriverState *bs)
                 fprintf(stderr, "Error %u: %s\n",
                         mysql_errno(s->conn),
                         mysql_error(s->conn));
-                goto fail;
+                goto fail_need_to_rollback;
             }
-        } COMMIT(s);
 
-        snprintf(SQLquery, SQLlen, 
-                 "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
-                 "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
-                 db_database, db_expertime_records,
-                 s->uuid_sign, datetime_str, datetime_str);
-
-        START_TRANSACTION(s) {
+            snprintf(SQLquery, SQLlen, 
+                     "INSERT INTO %s.%s(uuid, created_at, updated_at) VALUES "
+                     "('%s', cast('%s' as datetime), cast('%s' as datetime))", 
+                     db_database, db_expertime_records,
+                     s->uuid_sign, datetime_str, datetime_str);
+        
             if (mysql_query(s->conn, SQLquery) != 0) {
                 fprintf(stderr, "Error %u: %s\n",
                         mysql_errno(s->conn),
                         mysql_error(s->conn));
-                goto fail;
+                goto fail_need_to_rollback;
             }
         } COMMIT(s);
         
@@ -357,6 +365,8 @@ void release_all_accesslog_entry(BlockDriverState *bs)
     
     return;
 
+fail_need_to_rollback:
+    ROLLBACK(s);
 fail:
     g_free(SQLquery);
 fail_nofree:
