@@ -272,6 +272,7 @@ void release_all_accesslog_entry(BlockDriverState *bs)
     double start;
     int SQLlen;
     size_t str_epos = 0;
+    int count;
     
     if (!__sync_lock_test_and_set(&s->ready_for_logging, 1)) {
         return;
@@ -293,6 +294,9 @@ void release_all_accesslog_entry(BlockDriverState *bs)
     settimer(&start);
 
     qemu_mutex_lock(&s->lock); {
+
+        if (QLIST_EMPTY(&s->blk_accesslog))
+            goto nothing_to_do;
 
         if (!get_total_SQLquery_len(&SQLlen, s->accesslog_entry_count,
                                     db_database, db_disklog_records)) {
@@ -353,16 +357,17 @@ void release_all_accesslog_entry(BlockDriverState *bs)
                 goto fail_need_to_rollback;
             }
         } COMMIT(s);
+
+        g_free(SQLquery);
         
-        s->accesslog_entry_count = 0;
+nothing_to_do:
+        count = s->accesslog_entry_count;
+        s->accesslog_entry_count = 0;    
     }; qemu_mutex_unlock(&s->lock);
 
-    g_free(SQLquery);
-    g_disklogging_start_date += g_disklogging_interval / 1000;   
-
     fprintf(stderr, "Done (%d inserted, %lf sec consumed)\n", 
-            s->accesslog_entry_count, stoptimer(start));
-    
+            count, stoptimer(start));   
+    g_disklogging_start_date += g_disklogging_interval / 1000;       
     return;
 
 fail_need_to_rollback:
