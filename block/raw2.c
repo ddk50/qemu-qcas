@@ -1,4 +1,3 @@
-
 #ifndef __RAW2_EXTERNAL_TESTING__
 #include "qemu-common.h"
 #include "block_int.h"
@@ -56,7 +55,7 @@
                     mysql_error((x)->conn));                    \
             fprintf(stderr, "start transcation error\n");       \
         }                                                       \
-    } while (0);
+    } while (0)
 
 #define COMMIT(x)                                       \
     do {                                                \
@@ -66,7 +65,7 @@
                     mysql_error((x)->conn));            \
             fprintf(stderr, "commit error\n");          \
         }                                               \
-    } while (0);
+    } while (0)
 
 #define ROLLBACK(x)                                     \
     do {                                                \
@@ -76,7 +75,7 @@
                     mysql_error((x)->conn));            \
             fprintf(stderr, "rollback error\n");        \
         }                                               \
-    } while (0);
+    } while (0)
 
 typedef struct QEMU_PACKED hash_entry {
     uint8_t sha1_hash[20];
@@ -303,7 +302,9 @@ void release_all_accesslog_entry(BlockDriverState *bs)
             fprintf(stderr, "error get_total_SQLquery_len error\n");
             ret = -1;
             goto fail_nofree;
-        }
+        } else {
+            fprintf(stderr, "SQL query size: %d [kbytes]\n", SQLlen / 1024);
+        }       
         
         SQLquery = g_malloc0(SQLlen);
         assert(SQLquery != NULL);
@@ -336,7 +337,7 @@ void release_all_accesslog_entry(BlockDriverState *bs)
 
         SQLquery[str_epos - 1] = '\0'; /* remove last semi-colon */
     
-        START_TRANSACTION(s) {
+        START_TRANSACTION(s); {
             if (mysql_query(s->conn, SQLquery) != 0) {
                 fprintf(stderr, "Error %u: %s\n",
                         mysql_errno(s->conn),
